@@ -1,0 +1,20 @@
+{
+  "model_name": "microsoft/DialoGPT-medium",
+  "device": "cpu",
+  "experience_buffer_size": 10000,
+  "experience_save_path": "data/experience_buffer.pkl",
+  "memory_store_type": "chroma",
+  "max_memories": 5000,
+  "consolidation_threshold": 100,
+  "consolidation_interval": 24,
+  "ewc_lambda": 1000.0,
+  "meta_memory_size": 1000,
+  "decay_function": "exponential",
+  "decay_params": {
+    "decay_rate": 0.05,
+    "min_weight": 0.01
+  },
+  "weight_update_interval": 6,
+  "learning_rate": 1e-4,
+  "temperature": 0.8
+}
