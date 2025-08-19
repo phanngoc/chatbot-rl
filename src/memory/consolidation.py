@@ -16,6 +16,15 @@ from collections import defaultdict
 import pickle
 import os
 
+# OpenAI imports
+try:
+    from openai import OpenAI
+    import tiktoken
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    print("⚠️  OpenAI không có sẵn. Chỉ sử dụng HuggingFace models.")
+
 
 @dataclass
 class ConsolidatedKnowledge:
@@ -245,23 +254,155 @@ class KnowledgeGraph:
 
 
 class ModelDistillation:
-    """Knowledge Distillation để fine-tune base model với episodic memories"""
+    """Knowledge Distillation để fine-tune base model với episodic memories
+    Hỗ trợ cả HuggingFace và OpenAI API"""
     
     def __init__(self, 
                  base_model_name: str = "microsoft/DialoGPT-small",
-                 learning_rate: float = 1e-5):
-        self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(base_model_name)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+                 learning_rate: float = 1e-5,
+                 use_openai: bool = False,
+                 openai_model: str = "gpt-3.5-turbo",
+                 embedding_model: str = "text-embedding-ada-002",
+                 api_key: str = None):
         
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.use_openai = use_openai and OPENAI_AVAILABLE
+        
+        if self.use_openai:
+            # OpenAI setup
+            self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+            self.openai_model = openai_model
+            self.embedding_model = embedding_model
+            self.tokenizer_openai = tiktoken.encoding_for_model(openai_model)
+            
+            # Neural components cho OpenAI embeddings
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.embedding_dim = 1536  # text-embedding-ada-002 dimension
+            
+            # Distillation network cho OpenAI embeddings
+            self.distillation_network = nn.Sequential(
+                nn.Linear(self.embedding_dim, 512),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(512, 256),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(256, 128),
+                nn.Tanh()
+            ).to(self.device)
+            
+            self.optimizer = torch.optim.Adam(self.distillation_network.parameters(), lr=learning_rate)
+            self.embedding_cache: Dict[str, np.ndarray] = {}
+            
+        else:
+            # HuggingFace setup (original)
+            self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+            self.model = AutoModelForCausalLM.from_pretrained(base_model_name)
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+            
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
     
     def distill_from_memories(self, 
                             memories: List[Dict[str, Any]], 
                             num_epochs: int = 3,
-                            batch_size: int = 4) -> Dict[str, float]:
+                            batch_size: int = 4) -> Dict[str, Any]:
         """Distill knowledge từ episodic memories vào model weights"""
+        
+        if self.use_openai:
+            return self._distill_with_openai(memories, num_epochs, batch_size)
+        else:
+            return self._distill_with_huggingface(memories, num_epochs, batch_size)
+    
+    def _distill_with_openai(self, 
+                           memories: List[Dict[str, Any]], 
+                           num_epochs: int = 3,
+                           batch_size: int = 4) -> Dict[str, Any]:
+        """Distill knowledge sử dụng OpenAI embeddings"""
+        print(f"🔄 Bắt đầu OpenAI distillation với {len(memories)} memories...")
+        
+        # Prepare data với OpenAI embeddings
+        distillation_data = self._prepare_openai_distillation_data(memories)
+        
+        if not distillation_data:
+            return {
+                "status": "failed",
+                "reason": "no_valid_data",
+                "memories_processed": 0,
+                "method": "openai"
+            }
+        
+        total_loss = 0.0
+        total_batches = 0
+        token_stats = {"total_tokens": 0, "avg_efficiency": 0.0}
+        
+        self.distillation_network.train()
+        
+        for epoch in range(num_epochs):
+            epoch_loss = 0.0
+            epoch_batches = 0
+            
+            # Process in batches
+            for i in range(0, len(distillation_data), batch_size):
+                batch = distillation_data[i:i + batch_size]
+                
+                # Prepare batch embeddings
+                batch_embeddings, batch_targets = self._prepare_embedding_batch(batch)
+                
+                if batch_embeddings is None:
+                    continue
+                
+                # Forward pass
+                self.optimizer.zero_grad()
+                
+                # Convert embeddings to torch tensors
+                embeddings_tensor = torch.FloatTensor(batch_embeddings).to(self.device)
+                targets_tensor = torch.FloatTensor(batch_targets).to(self.device)
+                
+                # Distillation network forward
+                distilled_features = self.distillation_network(embeddings_tensor)
+                
+                # Reconstruction loss
+                loss = nn.MSELoss()(distilled_features, targets_tensor[:, :128])  # Match output dim
+                
+                # Backward pass
+                loss.backward()
+                self.optimizer.step()
+                
+                epoch_loss += loss.item()
+                total_loss += loss.item()
+                epoch_batches += 1
+                total_batches += 1
+            
+            avg_epoch_loss = epoch_loss / max(epoch_batches, 1)
+            print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {avg_epoch_loss:.4f}")
+        
+        # Calculate final metrics
+        avg_loss = total_loss / max(total_batches, 1)
+        
+        # Token efficiency analysis
+        for data in distillation_data:
+            efficiency = self._calculate_token_efficiency(data["context"])
+            token_stats["total_tokens"] += efficiency["token_count"]
+            token_stats["avg_efficiency"] += efficiency["efficiency_score"]
+        
+        token_stats["avg_efficiency"] /= max(len(distillation_data), 1)
+        
+        return {
+            "status": "completed",
+            "method": "openai",
+            "avg_loss": avg_loss,
+            "total_batches": total_batches,
+            "epochs": num_epochs,
+            "memories_processed": len(distillation_data),
+            "token_statistics": token_stats,
+            "embedding_cache_size": len(self.embedding_cache)
+        }
+    
+    def _distill_with_huggingface(self, 
+                                memories: List[Dict[str, Any]], 
+                                num_epochs: int = 3,
+                                batch_size: int = 4) -> Dict[str, Any]:
+        """Distill knowledge sử dụng HuggingFace models (original method)"""
         training_data = self._prepare_training_data(memories)
         
         total_loss = 0.0
@@ -297,6 +438,8 @@ class ModelDistillation:
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
         
         return {
+            "status": "completed",
+            "method": "huggingface",
             "avg_loss": avg_loss,
             "total_batches": num_batches,
             "epochs": num_epochs
@@ -350,25 +493,190 @@ class ModelDistillation:
             'input_ids': input_ids,
             'attention_mask': attention_mask
         }, target_ids
+    
+    def get_openai_embedding(self, text: str) -> np.ndarray:
+        """Lấy embedding từ OpenAI API với caching"""
+        if not self.use_openai:
+            return np.array([])
+            
+        # Check cache trước
+        if text in self.embedding_cache:
+            return self.embedding_cache[text]
+        
+        try:
+            # Call OpenAI embedding API
+            response = self.client.embeddings.create(
+                model=self.embedding_model,
+                input=text
+            )
+            
+            embedding = np.array(response.data[0].embedding)
+            
+            # Cache kết quả
+            self.embedding_cache[text] = embedding
+            
+            return embedding
+            
+        except Exception as e:
+            print(f"Lỗi khi lấy embedding: {e}")
+            # Fallback: random embedding
+            return np.random.normal(0, 0.1, self.embedding_dim)
+    
+    def _calculate_token_efficiency(self, text: str) -> Dict[str, Any]:
+        """Tính toán hiệu quả sử dụng token với OpenAI tokenizer"""
+        if not self.use_openai:
+            return {"token_count": 0, "efficiency_score": 0}
+            
+        try:
+            tokens = self.tokenizer_openai.encode(text)
+            return {
+                "token_count": len(tokens),
+                "character_count": len(text),
+                "tokens_per_char": len(tokens) / max(len(text), 1),
+                "efficiency_score": len(text) / max(len(tokens), 1)  # chars per token
+            }
+        except Exception as e:
+            print(f"Lỗi khi tokenize: {e}")
+            return {"token_count": 0, "efficiency_score": 0}
+    
+    def _prepare_openai_distillation_data(self, 
+                                        memories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Chuẩn bị data cho distillation với OpenAI embeddings"""
+        if not self.use_openai:
+            return []
+            
+        distillation_data = []
+        
+        for memory in memories:
+            context = memory.get('context', '')
+            content = memory.get('content', '')
+            reward = memory.get('reward', 0.0)
+            
+            # Chỉ sử dụng memories với reward tốt
+            if context and content and reward > 0.3:
+                distillation_data.append({
+                    'context': context,
+                    'content': content,
+                    'reward': reward,
+                    'memory_id': memory.get('id', 'unknown')
+                })
+        
+        print(f"📊 Filtered {len(distillation_data)} good memories từ {len(memories)} total")
+        return distillation_data
+    
+    def _prepare_embedding_batch(self, 
+                               batch: List[Dict[str, Any]]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Chuẩn bị batch embeddings cho OpenAI distillation"""
+        if not self.use_openai:
+            return None, None
+            
+        context_embeddings = []
+        content_embeddings = []
+        
+        for item in batch:
+            # Get embeddings cho context và content
+            context_emb = self.get_openai_embedding(item['context'])
+            content_emb = self.get_openai_embedding(item['content'])
+            
+            if context_emb.size > 0 and content_emb.size > 0:
+                context_embeddings.append(context_emb)
+                content_embeddings.append(content_emb)
+        
+        if not context_embeddings:
+            return None, None
+        
+        return np.array(context_embeddings), np.array(content_embeddings)
+    
+    def extract_distilled_knowledge(self, text: str) -> Dict[str, Any]:
+        """Extract distilled knowledge representation từ text"""
+        if self.use_openai:
+            return self._extract_with_openai(text)
+        else:
+            return self._extract_with_huggingface(text)
+    
+    def _extract_with_openai(self, text: str) -> Dict[str, Any]:
+        """Extract knowledge sử dụng OpenAI embeddings"""
+        # Get OpenAI embedding
+        embedding = self.get_openai_embedding(text)
+        
+        if embedding.size == 0:
+            return {"error": "Could not get embedding"}
+        
+        # Process qua distillation network
+        with torch.no_grad():
+            embedding_tensor = torch.FloatTensor(embedding).unsqueeze(0).to(self.device)
+            distilled_features = self.distillation_network(embedding_tensor)
+            
+        # Token analysis
+        token_info = self._calculate_token_efficiency(text)
+        
+        return {
+            "distilled_features": distilled_features.cpu().numpy().tolist(),
+            "original_embedding_dim": len(embedding),
+            "distilled_dim": distilled_features.shape[1],
+            "compression_ratio": len(embedding) / distilled_features.shape[1],
+            "token_analysis": token_info,
+            "method": "openai"
+        }
+    
+    def _extract_with_huggingface(self, text: str) -> Dict[str, Any]:
+        """Extract knowledge sử dụng HuggingFace model"""
+        # Simple representation using model embeddings
+        inputs = self.tokenizer(text, return_tensors="pt", max_length=128, truncation=True)
+        
+        with torch.no_grad():
+            if hasattr(self.model, 'get_input_embeddings'):
+                embeddings = self.model.get_input_embeddings()(inputs['input_ids'])
+                features = embeddings.mean(dim=1)  # Simple averaging
+            else:
+                features = torch.randn(1, 768)  # Fallback
+        
+        return {
+            "distilled_features": features.cpu().numpy().tolist(),
+            "original_embedding_dim": features.shape[1],
+            "distilled_dim": features.shape[1],
+            "compression_ratio": 1.0,
+            "method": "huggingface"
+        }
 
 
 class MemoryConsolidationSystem:
-    """Main system cho Memory Consolidation"""
+    """Main system cho Memory Consolidation với OpenAI support"""
     
     def __init__(self,
                  consolidation_threshold: int = 50,  # Số memories để trigger consolidation
-                 consolidation_interval_hours: int = 24):
+                 consolidation_interval_hours: int = 24,
+                 use_openai: bool = False,
+                 openai_model: str = "gpt-3.5-turbo",
+                 api_key: str = None):
         self.consolidation_threshold = consolidation_threshold
         self.consolidation_interval = timedelta(hours=consolidation_interval_hours)
         self.last_consolidation = datetime.now()
+        self.use_openai = use_openai and OPENAI_AVAILABLE
         
         # Initialize components
         self.summarizer = LLMSummarizer()
         self.knowledge_graph = KnowledgeGraph()
-        self.distillation = ModelDistillation()
+        
+        # Initialize ModelDistillation với OpenAI support
+        self.distillation = ModelDistillation(
+            use_openai=self.use_openai,
+            openai_model=openai_model,
+            api_key=api_key
+        )
         
         # Storage for consolidated knowledge
         self.consolidated_knowledge: Dict[str, ConsolidatedKnowledge] = {}
+        
+        # OpenAI client for enhanced summarization (optional)
+        if self.use_openai:
+            try:
+                self.openai_client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+                self.openai_model = openai_model
+                print(f"✅ OpenAI integration enabled với model: {openai_model}")
+            except Exception as e:
+                print(f"⚠️  Lỗi khi khởi tạo OpenAI client: {e}")
+                self.use_openai = False
     
     def should_consolidate(self, num_new_memories: int) -> bool:
         """Kiểm tra xem có nên chạy consolidation không"""
@@ -400,6 +708,48 @@ class MemoryConsolidationSystem:
         self.last_consolidation = datetime.now()
         return results
     
+    def enhance_summarization_with_openai(self, memories: List[Dict[str, Any]]) -> str:
+        """Enhanced summarization sử dụng OpenAI API"""
+        if not self.use_openai:
+            return self.summarizer.summarize_memories(memories)
+        
+        try:
+            # Prepare context từ memories
+            memory_texts = []
+            for memory in memories:
+                text = f"Context: {memory.get('context', '')}\nContent: {memory.get('content', '')}\nReward: {memory.get('reward', 0)}"
+                memory_texts.append(text)
+            
+            combined_text = "\n---\n".join(memory_texts)
+            
+            # Create enhanced prompt
+            prompt = f"""Phân tích và tóm tắt các trải nghiệm hội thoại sau thành kiến thức hữu ích và có cấu trúc:
+
+{combined_text}
+
+Hãy tạo một tóm tắt ngắn gọn (2-3 câu) về:
+1. Chủ đề chính
+2. Patterns hành vi người dùng
+3. Kiến thức quan trọng cần ghi nhớ
+
+Tóm tắt:"""
+
+            response = self.openai_client.chat.completions.create(
+                model=self.openai_model,
+                messages=[
+                    {"role": "system", "content": "Bạn là một AI chuyên phân tích và tóm tắt dữ liệu cuộc hội thoại."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=200,
+                temperature=0.3
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            print(f"⚠️  Lỗi OpenAI summarization, fallback to local: {e}")
+            return self.summarizer.summarize_memories(memories)
+    
     def _consolidate_via_summarization(self, memories: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Consolidation qua summarization"""
         # Group memories by similarity or topic (simplified)
@@ -410,7 +760,11 @@ class MemoryConsolidationSystem:
         
         for group in memory_groups:
             if len(group) >= 3:  # Chỉ consolidate nếu có ít nhất 3 memories
-                summary = self.summarizer.summarize_memories(group)
+                # Sử dụng enhanced summarization với OpenAI nếu có
+                if self.use_openai:
+                    summary = self.enhance_summarization_with_openai(group)
+                else:
+                    summary = self.summarizer.summarize_memories(group)
                 concepts = self.summarizer.extract_key_concepts(summary)
                 
                 # Create consolidated knowledge
@@ -588,3 +942,38 @@ class MemoryConsolidationSystem:
         # Save knowledge graph separately
         graph_filepath = filepath.replace('.json', '_graph.pkl')
         self.knowledge_graph.save_graph(graph_filepath)
+    
+    def get_system_info(self) -> Dict[str, Any]:
+        """Lấy thông tin về system và OpenAI integration"""
+        info = {
+            "consolidation_threshold": self.consolidation_threshold,
+            "consolidation_interval_hours": self.consolidation_interval.total_seconds() / 3600,
+            "last_consolidation": self.last_consolidation.isoformat(),
+            "total_consolidated_knowledge": len(self.consolidated_knowledge),
+            "knowledge_graph_nodes": self.knowledge_graph.graph.number_of_nodes(),
+            "knowledge_graph_edges": self.knowledge_graph.graph.number_of_edges(),
+            "openai_integration": {
+                "enabled": self.use_openai,
+                "available": OPENAI_AVAILABLE
+            }
+        }
+        
+        if self.use_openai:
+            info["openai_integration"].update({
+                "model": getattr(self, 'openai_model', 'unknown'),
+                "embedding_model": getattr(self.distillation, 'embedding_model', 'unknown'),
+                "embedding_cache_size": len(getattr(self.distillation, 'embedding_cache', {})),
+                "distillation_method": "openai_embeddings"
+            })
+        else:
+            info["openai_integration"]["distillation_method"] = "huggingface_local"
+        
+        return info
+    
+    def clear_embedding_cache(self) -> int:
+        """Xóa embedding cache để tiết kiệm memory"""
+        if self.use_openai and hasattr(self.distillation, 'embedding_cache'):
+            cache_size = len(self.distillation.embedding_cache)
+            self.distillation.embedding_cache.clear()
+            return cache_size
+        return 0

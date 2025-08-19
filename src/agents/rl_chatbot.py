@@ -7,10 +7,12 @@ import torch.nn as nn
 import uuid
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
-from transformers import AutoTokenizer, AutoModel
 import numpy as np
 import json
 import logging
+import openai
+import os
+from openai import OpenAI
 
 # Import các components đã implement
 from ..core.experience_replay import ExperienceReplayBuffer, Experience, ExperienceReplayTrainer
@@ -21,120 +23,170 @@ from ..core.meta_learning import MetaLearningEpisodicSystem
 from ..core.temporal_weighting import TemporalWeightingSystem
 
 
-class RLChatbotModel(nn.Module):
-    """Neural network model cho RL Chatbot"""
+class RLChatbotModel:
+    """OpenAI-based model cho RL Chatbot"""
     
     def __init__(self, 
-                 model_name: str = "microsoft/DialoGPT-medium",
+                 openai_model: str = "gpt-3.5-turbo",
+                 api_key: str = None,
                  hidden_size: int = 768,
-                 memory_dim: int = 256):
-        super().__init__()
+                 memory_dim: int = 256,
+                 max_tokens: int = 150,
+                 temperature: float = 0.8):
         
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.base_model = AutoModel.from_pretrained(model_name)
-        
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        # OpenAI client setup
+        self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+        self.openai_model = openai_model
+        self.max_tokens = max_tokens
+        self.temperature = temperature
         
         self.hidden_size = hidden_size
         self.memory_dim = memory_dim
         
-        # Memory integration layers
-        self.memory_projection = nn.Linear(memory_dim, hidden_size)
-        self.attention = nn.MultiheadAttention(hidden_size, num_heads=8, batch_first=True)
+        # Neural components cho RL value estimation
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Response generation
-        self.response_head = nn.Linear(hidden_size, self.tokenizer.vocab_size)
+        # Value estimation network (vẫn cần cho RL)
+        self.value_estimator = nn.Sequential(
+            nn.Linear(hidden_size, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 1)
+        ).to(self.device)
         
-        # Value head cho RL
-        self.value_head = nn.Linear(hidden_size, 1)
-        
-        # Dropout
-        self.dropout = nn.Dropout(0.1)
+        # Memory integration network
+        self.memory_processor = nn.Sequential(
+            nn.Linear(memory_dim, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size, hidden_size)
+        ).to(self.device)
     
-    def forward(self, 
-                input_ids: torch.Tensor,
-                attention_mask: torch.Tensor = None,
-                memory_context: torch.Tensor = None) -> Dict[str, torch.Tensor]:
-        """Forward pass với memory integration"""
+    def get_embedding_representation(self, text: str) -> torch.Tensor:
+        """Tạo embedding representation cho text để tính value estimate"""
+        # Tạo simple embedding từ text length và character distribution
+        # Trong thực tế có thể dùng sentence-transformer hoặc OpenAI embeddings
+        text_length = len(text)
+        char_counts = np.array([text.count(c) for c in "abcdefghijklmnopqrstuvwxyz"])
         
-        # Base model forward
-        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state  # (batch_size, seq_len, hidden_size)
+        # Pad đến hidden_size
+        features = np.zeros(self.hidden_size)
+        features[0] = text_length / 100  # Normalize
+        features[1:27] = char_counts / max(char_counts.sum(), 1)  # Normalize char distribution
         
-        # Memory integration
+        return torch.FloatTensor(features).unsqueeze(0).to(self.device)
+    
+    def estimate_value(self, text: str, memory_context: torch.Tensor = None) -> float:
+        """Estimate value cho RL từ text representation"""
+        
+        # Get text representation
+        text_embedding = self.get_embedding_representation(text)
+        
+        # Process memory context nếu có
         if memory_context is not None:
-            # Project memory to hidden size
-            memory_projected = self.memory_projection(memory_context)  # (batch_size, memory_len, hidden_size)
-            
-            # Attention between hidden states và memory
-            attended_output, attention_weights = self.attention(
-                hidden_states, memory_projected, memory_projected
-            )
-            
-            # Combine với residual connection
-            hidden_states = hidden_states + self.dropout(attended_output)
+            memory_processed = self.memory_processor(memory_context.to(self.device))
+            # Combine text embedding với memory context
+            combined_input = text_embedding + memory_processed.mean(dim=1)  # Simple combination
+        else:
+            combined_input = text_embedding
         
-        # Generate response logits
-        response_logits = self.response_head(hidden_states)
+        # Estimate value
+        with torch.no_grad():
+            value = self.value_estimator(combined_input)
         
-        # Generate value estimate
-        value_estimate = self.value_head(hidden_states.mean(dim=1))  # Pool over sequence
-        
-        return {
-            "response_logits": response_logits,
-            "value_estimate": value_estimate,
-            "hidden_states": hidden_states,
-            "attention_weights": attention_weights if memory_context is not None else None
-        }
+        return value.item()
     
     def generate_response(self, 
                          input_text: str,
                          memory_context: torch.Tensor = None,
-                         max_length: int = 100,
-                         temperature: float = 0.8) -> str:
-        """Generate response text"""
-        self.eval()
+                         conversation_history: List[Dict[str, str]] = None,
+                         temperature: float = None) -> Dict[str, Any]:
+        """Generate response sử dụng OpenAI API"""
         
-        # Tokenize input
-        inputs = self.tokenizer(
-            input_text,
-            return_tensors="pt",
-            max_length=512,
-            truncation=True,
-            padding=True
-        )
+        # Sử dụng temperature từ parameter hoặc default
+        temp = temperature if temperature is not None else self.temperature
         
-        with torch.no_grad():
-            # Forward pass
-            outputs = self.forward(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                memory_context=memory_context
+        # Prepare conversation messages
+        messages = []
+        
+        # System message với memory context nếu có
+        system_message = "Bạn là một AI chatbot thông minh và hữu ích. Hãy trả lời một cách tự nhiên và phù hợp."
+        
+        if memory_context is not None:
+            # Convert memory context thành text description
+            memory_info = self._format_memory_context(memory_context)
+            if memory_info:
+                system_message += f"\n\nThông tin từ memory: {memory_info}"
+        
+        messages.append({"role": "system", "content": system_message})
+        
+        # Thêm conversation history nếu có
+        if conversation_history:
+            for exchange in conversation_history[-5:]:  # Lấy 5 exchanges gần nhất
+                if "user_message" in exchange:
+                    messages.append({"role": "user", "content": exchange["user_message"]})
+                if "bot_response" in exchange:
+                    messages.append({"role": "assistant", "content": exchange["bot_response"]})
+        
+        # Thêm current user message
+        messages.append({"role": "user", "content": input_text})
+        
+        try:
+            # Call OpenAI API
+            response = self.client.chat.completions.create(
+                model=self.openai_model,
+                messages=messages,
+                max_tokens=self.max_tokens,
+                temperature=temp,
+                top_p=0.9,
+                frequency_penalty=0.1,
+                presence_penalty=0.1
             )
             
-            # Generate response using sampling
-            response_logits = outputs["response_logits"][:, -1, :]  # Last token logits
+            # Extract response text
+            response_text = response.choices[0].message.content.strip()
             
-            # Apply temperature
-            response_logits = response_logits / temperature
+            # Estimate value cho RL
+            value_estimate = self.estimate_value(response_text, memory_context)
             
-            # Sample next token
-            probs = torch.softmax(response_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            return {
+                "response_text": response_text,
+                "value_estimate": value_estimate,
+                "usage": {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens
+                },
+                "model_used": self.openai_model
+            }
             
-            # For simplicity, just return a mock response
-            # Trong thực tế sẽ implement full autoregressive generation
-            response = "Đây là response được generate từ RL Chatbot."
+        except Exception as e:
+            # Fallback response
+            fallback_response = f"Xin lỗi, tôi gặp vấn đề kỹ thuật: {str(e)}"
+            return {
+                "response_text": fallback_response,
+                "value_estimate": 0.0,
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "model_used": self.openai_model,
+                "error": str(e)
+            }
+    
+    def _format_memory_context(self, memory_context: torch.Tensor) -> str:
+        """Format memory context thành text mô tả"""
+        if memory_context is None:
+            return ""
         
-        return response
+        # Simple formatting - trong thực tế sẽ có logic phức tạp hơn
+        memory_size = memory_context.shape[1] if len(memory_context.shape) > 1 else 1
+        return f"Có {memory_size} memories liên quan được tìm thấy từ các cuộc hội thoại trước."
 
 
 class RLChatbotAgent:
     """Main RL Chatbot Agent tích hợp tất cả components"""
     
     def __init__(self,
-                 model_name: str = "microsoft/DialoGPT-medium",
+                 openai_model: str = "gpt-3.5-turbo",
+                 api_key: str = None,
                  device: str = "cpu",
                  config: Dict[str, Any] = None):
         
@@ -142,7 +194,12 @@ class RLChatbotAgent:
         self.config = config or {}
         
         # Initialize model
-        self.model = RLChatbotModel(model_name).to(device)
+        self.model = RLChatbotModel(
+            openai_model=openai_model,
+            api_key=api_key,
+            max_tokens=self.config.get("max_tokens", 150),
+            temperature=self.config.get("temperature", 0.8)
+        )
         
         # Initialize all RL components
         self._initialize_components()
@@ -252,15 +309,16 @@ class RLChatbotAgent:
         relevant_memories = self._retrieve_relevant_memories(user_message, context)
         
         # 2. Generate response với memory context
-        response = self._generate_response_with_memory(user_message, relevant_memories)
+        response_data = self._generate_response_with_memory(user_message, relevant_memories)
+        response_text = response_data["response_text"]
         
         # 3. Store experience
-        experience_id = self._store_experience(user_message, response, context, user_feedback)
+        experience_id = self._store_experience(user_message, response_text, context, user_feedback)
         
         # 4. Update conversation history
         self.conversation_history.append({
             "user_message": user_message,
-            "bot_response": response,
+            "bot_response": response_text,
             "timestamp": start_time,
             "experience_id": experience_id,
             "relevant_memories": len(relevant_memories)
@@ -276,12 +334,16 @@ class RLChatbotAgent:
         self.temporal_weighting.batch_update_weights()
         
         return {
-            "response": response,
+            "response": response_text,
             "conversation_id": self.current_conversation_id,
             "experience_id": experience_id,
             "relevant_memories_count": len(relevant_memories),
             "response_time_ms": (datetime.now() - start_time).total_seconds() * 1000,
-            "memory_stats": self._get_memory_stats()
+            "memory_stats": self._get_memory_stats(),
+            "openai_usage": response_data.get("usage", {}),
+            "value_estimate": response_data.get("value_estimate", 0.0),
+            "model_used": response_data.get("model_used", "unknown"),
+            "api_error": response_data.get("error")
         }
     
     def _retrieve_relevant_memories(self, 
@@ -326,7 +388,7 @@ class RLChatbotAgent:
     
     def _generate_response_with_memory(self, 
                                      user_message: str,
-                                     memories: List[Dict[str, Any]]) -> str:
+                                     memories: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Generate response sử dụng retrieved memories"""
         
         # Prepare memory context tensor
@@ -337,19 +399,24 @@ class RLChatbotAgent:
             memory_dim = 256
             memory_context = torch.randn(1, len(memories), memory_dim)
         
-        # Generate response
-        response = self.model.generate_response(
+        # Generate response using OpenAI API
+        response_data = self.model.generate_response(
             user_message, 
             memory_context=memory_context,
+            conversation_history=self.conversation_history,
             temperature=self.config.get("temperature", 0.8)
         )
         
-        # Enhance response với memory information (simplified)
-        if memories:
+        # Extract response text và thêm memory info nếu có
+        response_text = response_data["response_text"]
+        if memories and not response_data.get("error"):
             memory_info = f" [Sử dụng {len(memories)} memories liên quan]"
-            response += memory_info
+            response_text += memory_info
         
-        return response
+        # Update response_data với enhanced text
+        response_data["response_text"] = response_text
+        
+        return response_data
     
     def _store_experience(self, 
                          user_message: str,
@@ -538,9 +605,13 @@ class RLChatbotAgent:
         
         return {
             "model_info": {
-                "model_name": "RLChatbot",
+                "model_name": "RLChatbot with OpenAI",
+                "openai_model": self.model.openai_model,
                 "device": self.device,
-                "total_parameters": sum(p.numel() for p in self.model.parameters())
+                "neural_parameters": sum(p.numel() for p in self.model.value_estimator.parameters()) + 
+                                   sum(p.numel() for p in self.model.memory_processor.parameters()),
+                "max_tokens": self.model.max_tokens,
+                "temperature": self.model.temperature
             },
             "performance_metrics": self.performance_metrics,
             "memory_systems": self._get_memory_stats(),
@@ -556,10 +627,16 @@ class RLChatbotAgent:
         """Lưu state của agent"""
         
         try:
-            # Save model
+            # Save model configuration và neural components
             model_path = filepath.replace('.json', '_model.pt')
             torch.save({
-                'model_state_dict': self.model.state_dict(),
+                'value_estimator_state_dict': self.model.value_estimator.state_dict(),
+                'memory_processor_state_dict': self.model.memory_processor.state_dict(),
+                'openai_model': self.model.openai_model,
+                'max_tokens': self.model.max_tokens,
+                'temperature': self.model.temperature,
+                'hidden_size': self.model.hidden_size,
+                'memory_dim': self.model.memory_dim,
                 'config': self.config
             }, model_path)
             
@@ -600,7 +677,18 @@ class RLChatbotAgent:
             model_path = filepath.replace('.json', '_model.pt')
             if os.path.exists(model_path):
                 checkpoint = torch.load(model_path, map_location=self.device)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
+                # Load neural components
+                if 'value_estimator_state_dict' in checkpoint:
+                    self.model.value_estimator.load_state_dict(checkpoint['value_estimator_state_dict'])
+                if 'memory_processor_state_dict' in checkpoint:
+                    self.model.memory_processor.load_state_dict(checkpoint['memory_processor_state_dict'])
+                # Update model config
+                if 'openai_model' in checkpoint:
+                    self.model.openai_model = checkpoint['openai_model']
+                if 'max_tokens' in checkpoint:
+                    self.model.max_tokens = checkpoint['max_tokens']
+                if 'temperature' in checkpoint:
+                    self.model.temperature = checkpoint['temperature']
                 self.config.update(checkpoint.get('config', {}))
             
             # Load all systems

@@ -1,17 +1,18 @@
-# Chatbot Cá Nhân Hóa với Reinforcement Learning
+# Chatbot Cá Nhân Hóa với Reinforcement Learning + OpenAI
 
-Dự án MVP thiết kế chatbot cá nhân hóa sử dụng các thuật toán Reinforcement Learning và Episodic Memory tiên tiến.
+Dự án MVP thiết kế chatbot cá nhân hóa sử dụng các thuật toán Reinforcement Learning, Episodic Memory tiên tiến, và tích hợp với OpenAI API để tạo ra trải nghiệm chat chất lượng cao.
 
 ## 🎯 Tính năng chính
 
 ### Thuật toán chính được triển khai:
 
-1. **Experience Replay (ER)** - Lưu trữ và replay các trải nghiệm để tránh catastrophic forgetting
-2. **Retrieval-Augmented Episodic Memory** - Vector search với FAISS/ChromaDB cho memory retrieval
-3. **Episodic Memory Consolidation** - Chuyển đổi từ episodic sang semantic memory (giống hippocampus)
-4. **Elastic Weight Consolidation (EWC)** - Bảo vệ trọng số quan trọng khi học task mới
-5. **Meta-learning với Episodic Memory** - MANN, NTM patterns để học cách chọn lọc trải nghiệm
-6. **Temporal Decay & Importance Weighting** - Quản lý trọng số memory theo thời gian và importance
+1. **OpenAI Integration** - Sử dụng GPT-3.5-turbo/GPT-4 cho high-quality response generation
+2. **Experience Replay (ER)** - Lưu trữ và replay các trải nghiệm để tránh catastrophic forgetting
+3. **Retrieval-Augmented Episodic Memory** - Vector search với FAISS/ChromaDB cho memory retrieval
+4. **Episodic Memory Consolidation** - Chuyển đổi từ episodic sang semantic memory (giống hippocampus)
+5. **Elastic Weight Consolidation (EWC)** - Bảo vệ trọng số quan trọng khi học task mới
+6. **Meta-learning với Episodic Memory** - MANN, NTM patterns để học cách chọn lọc trải nghiệm
+7. **Temporal Decay & Importance Weighting** - Quản lý trọng số memory theo thời gian và importance
 
 ## 🚀 Cài đặt nhanh
 
@@ -23,9 +24,14 @@ cd chatbot-rl
 # Cài đặt dependencies
 pip install -r requirements.txt
 
+# Setup OpenAI API Key
+export OPENAI_API_KEY="your-api-key-here"
+
 # Chạy demo
 ./run_demo.sh
 ```
+
+**📖 Chi tiết:** Xem [QUICKSTART.md](QUICKSTART.md) để hướng dẫn setup và sử dụng OpenAI API
 
 ## 📁 Cấu trúc dự án
 
