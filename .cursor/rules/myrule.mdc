@@ -1,0 +1,9 @@
+---
+description: |
+  - Các hướng dẫn sử dụng, cài đặt nằm trong thư mục docs.
+  - Các file shell script để test phải đặt dưới thư mục ./tests.
+  - Các script để test tính năng phải đặt dưới thư mục ./tests.
+  - Dọn dẹp các file test sau khi chạy.
+globs:
+alwaysApply: true
+---

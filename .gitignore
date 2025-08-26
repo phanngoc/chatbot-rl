@@ -1,0 +1,41 @@
+# Ignore thư mục và file dữ liệu, model, cache, log, v.v.
+data/
+logs/
+outputs/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.h5
+*.pkl
+*.db
+*.sqlite
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+__pycache__/
+.ipynb_checkpoints/
+.env
+.venv
+env/
+venv/
+.DS_Store
+
+# Ignore file cấu hình cá nhân
+*.local.json
+*.secrets.json
+
+# Ignore file hệ thống
+*.pyc
+
+# Ignore file test output
+test_outputs/
+coverage/
+htmlcov/
+
+# Ignore file của IDE
+.vscode/
+.idea/
+*.code-workspace

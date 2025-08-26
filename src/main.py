@@ -6,7 +6,12 @@ import argparse
 import json
 import os
 from typing import Dict, Any
+from dotenv import load_dotenv
+import openai
 from agents.rl_chatbot import RLChatbotAgent
+
+# Load environment variables
+load_dotenv()
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -15,22 +20,12 @@ def load_config(config_path: str) -> Dict[str, Any]:
         with open(config_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     else:
-        # Default configuration
+        # Default configuration from environment variables
         return {
-            "model_name": "microsoft/DialoGPT-medium",
-            "device": "cpu",
-            "experience_buffer_size": 10000,
-            "memory_store_type": "chroma",
-            "max_memories": 5000,
-            "consolidation_threshold": 100,
-            "consolidation_interval": 24,
-            "ewc_lambda": 1000.0,
-            "meta_memory_size": 1000,
-            "decay_function": "exponential",
-            "decay_params": {"decay_rate": 0.05, "min_weight": 0.01},
-            "weight_update_interval": 6,
-            "learning_rate": 1e-4,
-            "temperature": 0.8
+            "model_name": os.getenv("RL_MODEL_NAME", "microsoft/DialoGPT-medium"),
+            "experience_buffer_size": int(os.getenv("RL_EXPERIENCE_BUFFER_SIZE", "10000")),
+            "max_memories": int(os.getenv("RL_MAX_MEMORIES", "5000")),
+            "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0.8"))
         }
 
 
@@ -103,8 +98,8 @@ def interactive_chat(agent: RLChatbotAgent):
                     feedback_score = (float(feedback_input) - 3) / 2  # Convert 1-5 to -1 to 1
                     agent.provide_feedback(result['experience_id'], feedback_score)
                     print("✅ Cảm ơn feedback của bạn!")
-                except ValueError:
-                    print("❌ Feedback không hợp lệ")
+                except ValueError as e:
+                    print(f"❌ Feedback không hợp lệ: {e}")
         
         except KeyboardInterrupt:
             print("\n👋 Tạm biệt!")
@@ -260,10 +255,18 @@ def main():
     config = load_config(args.config)
     print(f"📋 Loaded config from: {args.config}")
     
+    # Configure OpenAI
+    openai.api_key = os.getenv("OPENAI_API_KEY")
+    if not openai.api_key:
+        print("⚠️ Warning: OPENAI_API_KEY không được thiết lập. Vui lòng tạo file .env với API key của bạn.")
+        print("   Bạn có thể tạo file .env từ .env.example")
+    else:
+        print("✅ OpenAI API key đã được thiết lập")
+    
     # Initialize agent
     print("🚀 Initializing RL Chatbot Agent...")
     agent = RLChatbotAgent(
-        model_name=config.get("model_name", "microsoft/DialoGPT-medium"),
+        openai_model=config.get("openai_model", "gpt-4o-mini"),
         device=config.get("device", "cpu"),
         config=config
     )

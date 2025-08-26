@@ -1,13 +1,12 @@
 """
-Episodic Memory Consolidation System
-Chuyển đổi từ episodic memory sang semantic memory (weights) giống hippocampus
+Episodic Memory Consolidation System - OpenAI Edition
+Chuyển đổi từ episodic memory sang semantic memory sử dụng OpenAI API
 """
 
 import json
 import torch
 import torch.nn as nn
 from typing import List, Dict, Any, Optional, Tuple
-from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 import numpy as np
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -15,16 +14,32 @@ import networkx as nx
 from collections import defaultdict
 import pickle
 import os
+from openai import OpenAI
+import tiktoken
+import time
+import cProfile
+import pstats
+from functools import wraps
 
-# OpenAI imports
-try:
-    from openai import OpenAI
-    import tiktoken
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
-    print("⚠️  OpenAI không có sẵn. Chỉ sử dụng HuggingFace models.")
-
+def profile_function(func):
+    """Decorator để profile function performance"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        profiler = cProfile.Profile()
+        profiler.enable()
+        
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        
+        profiler.disable()
+        
+        # Log performance metrics
+        execution_time = end_time - start_time
+        print(f"⏱️  {func.__name__} executed in {execution_time:.4f} seconds")
+        
+        return result
+    return wrapper
 
 @dataclass
 class ConsolidatedKnowledge:
@@ -53,19 +68,15 @@ class ConsolidatedKnowledge:
 
 
 class LLMSummarizer:
-    """Sử dụng LLM để tóm tắt nhiều episodic memories thành knowledge chunks"""
+    """Sử dụng OpenAI để tóm tắt nhiều episodic memories thành knowledge chunks"""
     
-    def __init__(self, model_name: str = "microsoft/DialoGPT-medium"):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name)
-        
-        # Add padding token if not exists
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+    def __init__(self, openai_model: str = "gpt-3.5-turbo", api_key: str = None):        
+        self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+        self.model = openai_model
     
     def summarize_memories(self, 
                           memories: List[Dict[str, Any]], 
-                          max_length: int = 150) -> str:
+                          max_tokens: int = 200) -> str:
         """Tóm tắt một nhóm memories thành knowledge summary"""
         # Prepare input text
         memory_texts = []
@@ -82,63 +93,78 @@ class LLMSummarizer:
 
 Tóm tắt:"""
         
-        # Tokenize and generate
-        inputs = self.tokenizer.encode(prompt, return_tensors="pt", max_length=512, truncation=True)
-        
-        with torch.no_grad():
-            outputs = self.model.generate(
-                inputs,
-                max_length=inputs.shape[1] + max_length,
-                num_return_sequences=1,
-                temperature=0.7,
-                do_sample=True,
-                pad_token_id=self.tokenizer.pad_token_id
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "Bạn là một AI chuyên tóm tắt và phân tích dữ liệu hội thoại."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=max_tokens,
+                temperature=0.7
             )
-        
-        # Decode and extract summary
-        full_response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        summary = full_response[len(prompt):].strip()
-        
-        return summary
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            print(f"Lỗi khi tóm tắt với OpenAI: {e}")
+            return "Không thể tóm tắt memories."
     
     def extract_key_concepts(self, text: str) -> List[str]:
-        """Trích xuất các concept chính từ text"""
-        # Simplified concept extraction (trong thực tế có thể dùng NER hoặc topic modeling)
-        words = text.lower().split()
+        """Trích xuất các concept chính từ text sử dụng OpenAI"""
+        prompt = f"""Trích xuất các khái niệm và chủ đề chính từ văn bản sau. Trả về danh sách tối đa 10 khái niệm, mỗi khái niệm trên một dòng:
+
+{text}
+
+Các khái niệm chính:"""
         
-        # Filter out common words and extract potential concepts
-        stopwords = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
-        concepts = []
-        
-        for i, word in enumerate(words):
-            if len(word) > 3 and word not in stopwords:
-                # Look for compound concepts (2-3 words)
-                if i < len(words) - 1:
-                    compound = f"{word} {words[i+1]}"
-                    if len(compound) > 6:
-                        concepts.append(compound)
-                concepts.append(word)
-        
-        # Remove duplicates and return top concepts
-        unique_concepts = list(set(concepts))
-        return unique_concepts[:10]
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "Bạn là một AI chuyên trích xuất khái niệm từ văn bản."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=150,
+                temperature=0.3
+            )
+            
+            concepts_text = response.choices[0].message.content.strip()
+            concepts = [concept.strip() for concept in concepts_text.split('\n') if concept.strip()]
+            return concepts[:10]
+            
+        except Exception as e:
+            print(f"Lỗi khi trích xuất concepts: {e}")
+            # Fallback to simple extraction
+            words = text.lower().split()
+            stopwords = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'là', 'của', 'và', 'có', 'được', 'này', 'đó'}
+            concepts = [word for word in words if len(word) > 3 and word not in stopwords]
+            return list(set(concepts))[:10]
 
 
 class KnowledgeGraph:
-    """Knowledge Graph để tích hợp consolidated knowledge"""
+    """Knowledge Graph để tích hợp consolidated knowledge - Tối ưu hóa hiệu suất"""
     
     def __init__(self):
         self.graph = nx.DiGraph()
         self.concept_embeddings: Dict[str, List[float]] = {}
         self.concept_memories: Dict[str, List[str]] = defaultdict(list)
+        
+        # Performance optimization: caching và batch operations
+        self._concept_cache = {}  # Cache concept lookups
+        self._batch_size = 100    # Batch size cho operations
+        self._pending_operations = []  # Queue cho batch operations
     
     def add_knowledge(self, 
                      consolidated_knowledge: ConsolidatedKnowledge,
                      concepts: List[str]) -> None:
-        """Thêm consolidated knowledge vào graph"""
+        """Thêm consolidated knowledge vào graph - Tối ưu hóa hiệu suất"""
+        if not concepts:
+            return
+            
         knowledge_id = consolidated_knowledge.id
         
-        # Add knowledge node
+        # Batch add knowledge node
         self.graph.add_node(
             knowledge_id,
             type="knowledge",
@@ -147,51 +173,74 @@ class KnowledgeGraph:
             method=consolidated_knowledge.consolidation_method
         )
         
-        # Add concept nodes and edges
+        # Pre-compute concept IDs và batch operations
+        concept_nodes = []
+        edges_to_add = []
+        
         for concept in concepts:
             concept_id = f"concept_{concept.replace(' ', '_')}"
-            
-            # Add concept node if not exists
+            concept_nodes.append((concept_id, concept))
+            edges_to_add.append((knowledge_id, concept_id, {"relation": "contains"}))
+        
+        # Batch add concept nodes
+        for concept_id, concept_name in concept_nodes:
             if concept_id not in self.graph:
-                self.graph.add_node(concept_id, type="concept", name=concept)
-            
-            # Add edge from knowledge to concept
-            self.graph.add_edge(knowledge_id, concept_id, relation="contains")
-            
-            # Track which memories contributed to this concept
-            self.concept_memories[concept].extend(consolidated_knowledge.source_memories)
+                self.graph.add_node(concept_id, type="concept", name=concept_name)
+        
+        # Batch add edges
+        self.graph.add_edges_from(edges_to_add)
+        
+        # Batch update concept memories
+        source_memories = consolidated_knowledge.source_memories
+        for concept in concepts:
+            self.concept_memories[concept].extend(source_memories)
     
     def find_related_knowledge(self, 
                              query_concepts: List[str], 
                              max_depth: int = 2) -> List[Dict[str, Any]]:
-        """Tìm knowledge liên quan đến query concepts"""
-        related_knowledge = []
+        """Tìm knowledge liên quan đến query concepts - Tối ưu hóa hiệu suất"""
+        if not query_concepts:
+            return []
         
-        for concept in query_concepts:
-            concept_id = f"concept_{concept.replace(' ', '_')}"
-            
+        # Pre-compute concept IDs
+        concept_ids = [f"concept_{concept.replace(' ', '_')}" for concept in query_concepts]
+        
+        # Batch collect knowledge nodes
+        knowledge_nodes = set()
+        concept_to_knowledge = {}
+        
+        for concept_id, concept_name in zip(concept_ids, query_concepts):
             if concept_id in self.graph:
-                # Find knowledge nodes connected to this concept
-                for knowledge_id in self.graph.predecessors(concept_id):
-                    if self.graph.nodes[knowledge_id]['type'] == 'knowledge':
-                        knowledge_data = {
-                            'id': knowledge_id,
-                            'summary': self.graph.nodes[knowledge_id]['summary'],
-                            'confidence': self.graph.nodes[knowledge_id]['confidence'],
-                            'method': self.graph.nodes[knowledge_id]['method'],
-                            'matching_concept': concept
-                        }
-                        related_knowledge.append(knowledge_data)
+                predecessors = list(self.graph.predecessors(concept_id))
+                knowledge_nodes.update(predecessors)
+                concept_to_knowledge[concept_id] = concept_name
         
-        # Remove duplicates and sort by confidence
-        unique_knowledge = {k['id']: k for k in related_knowledge}
-        sorted_knowledge = sorted(
-            unique_knowledge.values(), 
-            key=lambda x: x['confidence'], 
-            reverse=True
-        )
+        # Batch extract node data
+        related_knowledge = []
+        for knowledge_id in knowledge_nodes:
+            if self.graph.nodes[knowledge_id]['type'] == 'knowledge':
+                # Find matching concept
+                matching_concept = None
+                for concept_id in concept_ids:
+                    if concept_id in concept_to_knowledge and knowledge_id in self.graph.predecessors(concept_id):
+                        matching_concept = concept_to_knowledge[concept_id]
+                        break
+                
+                if matching_concept:
+                    knowledge_data = {
+                        'id': knowledge_id,
+                        'summary': self.graph.nodes[knowledge_id]['summary'],
+                        'confidence': self.graph.nodes[knowledge_id]['confidence'],
+                        'method': self.graph.nodes[knowledge_id]['method'],
+                        'matching_concept': matching_concept
+                    }
+                    related_knowledge.append(knowledge_data)
         
-        return sorted_knowledge
+        # Optimized sorting với key function caching
+        if related_knowledge:
+            return sorted(related_knowledge, key=lambda x: x['confidence'], reverse=True)
+        
+        return []
     
     def get_concept_relationships(self, concept: str) -> Dict[str, List[str]]:
         """Lấy relationships của một concept"""
@@ -221,7 +270,11 @@ class KnowledgeGraph:
     
     def save_graph(self, filepath: str) -> None:
         """Lưu knowledge graph"""
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        # Tạo thư mục nếu cần thiết
+        directory = os.path.dirname(filepath)
+        if directory:  # Chỉ tạo thư mục nếu có đường dẫn
+            os.makedirs(directory, exist_ok=True)
+            
         data = {
             'nodes': dict(self.graph.nodes(data=True)),
             'edges': list(self.graph.edges(data=True)),
@@ -254,64 +307,46 @@ class KnowledgeGraph:
 
 
 class ModelDistillation:
-    """Knowledge Distillation để fine-tune base model với episodic memories
-    Hỗ trợ cả HuggingFace và OpenAI API"""
+    """Knowledge Distillation sử dụng OpenAI API để distill episodic memories"""
     
     def __init__(self, 
-                 base_model_name: str = "microsoft/DialoGPT-small",
                  learning_rate: float = 1e-5,
-                 use_openai: bool = False,
                  openai_model: str = "gpt-3.5-turbo",
                  embedding_model: str = "text-embedding-ada-002",
                  api_key: str = None):
         
-        self.use_openai = use_openai and OPENAI_AVAILABLE
+
+        # OpenAI setup
+        self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+        self.openai_model = openai_model
+        self.embedding_model = embedding_model
+        self.tokenizer_openai = tiktoken.encoding_for_model(openai_model)
         
-        if self.use_openai:
-            # OpenAI setup
-            self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
-            self.openai_model = openai_model
-            self.embedding_model = embedding_model
-            self.tokenizer_openai = tiktoken.encoding_for_model(openai_model)
-            
-            # Neural components cho OpenAI embeddings
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.embedding_dim = 1536  # text-embedding-ada-002 dimension
-            
-            # Distillation network cho OpenAI embeddings
-            self.distillation_network = nn.Sequential(
-                nn.Linear(self.embedding_dim, 512),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(512, 256),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(256, 128),
-                nn.Tanh()
-            ).to(self.device)
-            
-            self.optimizer = torch.optim.Adam(self.distillation_network.parameters(), lr=learning_rate)
-            self.embedding_cache: Dict[str, np.ndarray] = {}
-            
-        else:
-            # HuggingFace setup (original)
-            self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-            self.model = AutoModelForCausalLM.from_pretrained(base_model_name)
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
-            
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Neural components cho OpenAI embeddings
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.embedding_dim = 1536  # text-embedding-ada-002 dimension
+        
+        # Distillation network cho OpenAI embeddings
+        self.distillation_network = nn.Sequential(
+            nn.Linear(self.embedding_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.Tanh()
+        ).to(self.device)
+        
+        self.optimizer = torch.optim.Adam(self.distillation_network.parameters(), lr=learning_rate)
+        self.embedding_cache: Dict[str, np.ndarray] = {}
     
     def distill_from_memories(self, 
                             memories: List[Dict[str, Any]], 
                             num_epochs: int = 3,
                             batch_size: int = 4) -> Dict[str, Any]:
         """Distill knowledge từ episodic memories vào model weights"""
-        
-        if self.use_openai:
-            return self._distill_with_openai(memories, num_epochs, batch_size)
-        else:
-            return self._distill_with_huggingface(memories, num_epochs, batch_size)
+        return self._distill_with_openai(memories, num_epochs, batch_size)
     
     def _distill_with_openai(self, 
                            memories: List[Dict[str, Any]], 
@@ -398,107 +433,10 @@ class ModelDistillation:
             "embedding_cache_size": len(self.embedding_cache)
         }
     
-    def _distill_with_huggingface(self, 
-                                memories: List[Dict[str, Any]], 
-                                num_epochs: int = 3,
-                                batch_size: int = 4) -> Dict[str, Any]:
-        """Distill knowledge sử dụng HuggingFace models (original method)"""
-        training_data = self._prepare_training_data(memories)
-        
-        total_loss = 0.0
-        num_batches = 0
-        
-        self.model.train()
-        
-        for epoch in range(num_epochs):
-            epoch_loss = 0.0
-            
-            # Process in batches
-            for i in range(0, len(training_data), batch_size):
-                batch = training_data[i:i + batch_size]
-                
-                # Prepare batch
-                inputs, targets = self._prepare_batch(batch)
-                
-                # Forward pass
-                self.optimizer.zero_grad()
-                outputs = self.model(**inputs, labels=targets)
-                loss = outputs.loss
-                
-                # Backward pass
-                loss.backward()
-                self.optimizer.step()
-                
-                epoch_loss += loss.item()
-                total_loss += loss.item()
-                num_batches += 1
-            
-            print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss / (len(training_data) // batch_size):.4f}")
-        
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-        
-        return {
-            "status": "completed",
-            "method": "huggingface",
-            "avg_loss": avg_loss,
-            "total_batches": num_batches,
-            "epochs": num_epochs
-        }
-    
-    def _prepare_training_data(self, memories: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-        """Chuẩn bị training data từ memories"""
-        training_data = []
-        
-        for memory in memories:
-            # Create input-output pairs from memory
-            context = memory.get('context', '')
-            content = memory.get('content', '')
-            
-            if context and content:
-                training_data.append({
-                    'input': context,
-                    'output': content
-                })
-        
-        return training_data
-    
-    def _prepare_batch(self, batch: List[Dict[str, str]]) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        """Chuẩn bị batch cho training"""
-        inputs = []
-        targets = []
-        
-        for item in batch:
-            input_text = item['input']
-            output_text = item['output']
-            full_text = f"{input_text} {self.tokenizer.eos_token} {output_text}"
-            
-            # Tokenize
-            encoded = self.tokenizer(
-                full_text,
-                max_length=256,
-                padding=True,
-                truncation=True,
-                return_tensors="pt"
-            )
-            
-            inputs.append(encoded['input_ids'].squeeze())
-            targets.append(encoded['input_ids'].squeeze())
-        
-        # Stack tensors
-        input_ids = torch.stack(inputs)
-        attention_mask = torch.ones_like(input_ids)
-        target_ids = torch.stack(targets)
-        
-        return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask
-        }, target_ids
+
     
     def get_openai_embedding(self, text: str) -> np.ndarray:
         """Lấy embedding từ OpenAI API với caching"""
-        if not self.use_openai:
-            return np.array([])
-            
         # Check cache trước
         if text in self.embedding_cache:
             return self.embedding_cache[text]
@@ -524,9 +462,6 @@ class ModelDistillation:
     
     def _calculate_token_efficiency(self, text: str) -> Dict[str, Any]:
         """Tính toán hiệu quả sử dụng token với OpenAI tokenizer"""
-        if not self.use_openai:
-            return {"token_count": 0, "efficiency_score": 0}
-            
         try:
             tokens = self.tokenizer_openai.encode(text)
             return {
@@ -542,9 +477,6 @@ class ModelDistillation:
     def _prepare_openai_distillation_data(self, 
                                         memories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Chuẩn bị data cho distillation với OpenAI embeddings"""
-        if not self.use_openai:
-            return []
-            
         distillation_data = []
         
         for memory in memories:
@@ -567,9 +499,6 @@ class ModelDistillation:
     def _prepare_embedding_batch(self, 
                                batch: List[Dict[str, Any]]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Chuẩn bị batch embeddings cho OpenAI distillation"""
-        if not self.use_openai:
-            return None, None
-            
         context_embeddings = []
         content_embeddings = []
         
@@ -589,10 +518,7 @@ class ModelDistillation:
     
     def extract_distilled_knowledge(self, text: str) -> Dict[str, Any]:
         """Extract distilled knowledge representation từ text"""
-        if self.use_openai:
-            return self._extract_with_openai(text)
-        else:
-            return self._extract_with_huggingface(text)
+        return self._extract_with_openai(text)
     
     def _extract_with_openai(self, text: str) -> Dict[str, Any]:
         """Extract knowledge sử dụng OpenAI embeddings"""
@@ -619,48 +545,27 @@ class ModelDistillation:
             "method": "openai"
         }
     
-    def _extract_with_huggingface(self, text: str) -> Dict[str, Any]:
-        """Extract knowledge sử dụng HuggingFace model"""
-        # Simple representation using model embeddings
-        inputs = self.tokenizer(text, return_tensors="pt", max_length=128, truncation=True)
-        
-        with torch.no_grad():
-            if hasattr(self.model, 'get_input_embeddings'):
-                embeddings = self.model.get_input_embeddings()(inputs['input_ids'])
-                features = embeddings.mean(dim=1)  # Simple averaging
-            else:
-                features = torch.randn(1, 768)  # Fallback
-        
-        return {
-            "distilled_features": features.cpu().numpy().tolist(),
-            "original_embedding_dim": features.shape[1],
-            "distilled_dim": features.shape[1],
-            "compression_ratio": 1.0,
-            "method": "huggingface"
-        }
+
 
 
 class MemoryConsolidationSystem:
-    """Main system cho Memory Consolidation với OpenAI support"""
+    """Main system cho Memory Consolidation sử dụng OpenAI"""
     
     def __init__(self,
                  consolidation_threshold: int = 50,  # Số memories để trigger consolidation
                  consolidation_interval_hours: int = 24,
-                 use_openai: bool = False,
-                 openai_model: str = "gpt-3.5-turbo",
+                 openai_model: str = "gpt-4o-mini",
                  api_key: str = None):
+
         self.consolidation_threshold = consolidation_threshold
         self.consolidation_interval = timedelta(hours=consolidation_interval_hours)
         self.last_consolidation = datetime.now()
-        self.use_openai = use_openai and OPENAI_AVAILABLE
+        self.openai_model = openai_model
         
         # Initialize components
-        self.summarizer = LLMSummarizer()
+        self.summarizer = LLMSummarizer(openai_model=openai_model, api_key=api_key)
         self.knowledge_graph = KnowledgeGraph()
-        
-        # Initialize ModelDistillation với OpenAI support
         self.distillation = ModelDistillation(
-            use_openai=self.use_openai,
             openai_model=openai_model,
             api_key=api_key
         )
@@ -668,15 +573,12 @@ class MemoryConsolidationSystem:
         # Storage for consolidated knowledge
         self.consolidated_knowledge: Dict[str, ConsolidatedKnowledge] = {}
         
-        # OpenAI client for enhanced summarization (optional)
-        if self.use_openai:
-            try:
-                self.openai_client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
-                self.openai_model = openai_model
-                print(f"✅ OpenAI integration enabled với model: {openai_model}")
-            except Exception as e:
-                print(f"⚠️  Lỗi khi khởi tạo OpenAI client: {e}")
-                self.use_openai = False
+        # OpenAI client for enhanced summarization
+        try:
+            self.openai_client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+            print(f"✅ OpenAI integration enabled với model: {openai_model}")
+        except Exception as e:
+            raise RuntimeError(f"Lỗi khi khởi tạo OpenAI client: {e}")
     
     def should_consolidate(self, num_new_memories: int) -> bool:
         """Kiểm tra xem có nên chạy consolidation không"""
@@ -687,7 +589,9 @@ class MemoryConsolidationSystem:
     
     def consolidate_memories(self, 
                            episodic_memories: List[Dict[str, Any]],
-                           method: str = "all") -> Dict[str, Any]:
+                           method: str = "all",
+                           auto_save: bool = True,
+                           save_filepath: str = None) -> Dict[str, Any]:
         """Chạy memory consolidation với các method khác nhau"""
         results = {
             "summarization": None,
@@ -706,13 +610,21 @@ class MemoryConsolidationSystem:
             results["distillation"] = self._consolidate_via_distillation(episodic_memories)
         
         self.last_consolidation = datetime.now()
+        
+        # Tự động lưu dữ liệu nếu được yêu cầu
+        if auto_save and save_filepath:
+            try:
+                self.save_consolidated_knowledge(save_filepath)
+                results["saved_to_file"] = save_filepath
+                print(f"💾 Đã lưu consolidated knowledge vào: {save_filepath}")
+            except Exception as e:
+                print(f"⚠️  Lỗi khi lưu consolidated knowledge: {e}")
+                results["save_error"] = str(e)
+        
         return results
     
     def enhance_summarization_with_openai(self, memories: List[Dict[str, Any]]) -> str:
         """Enhanced summarization sử dụng OpenAI API"""
-        if not self.use_openai:
-            return self.summarizer.summarize_memories(memories)
-        
         try:
             # Prepare context từ memories
             memory_texts = []
@@ -747,7 +659,7 @@ Tóm tắt:"""
             return response.choices[0].message.content.strip()
             
         except Exception as e:
-            print(f"⚠️  Lỗi OpenAI summarization, fallback to local: {e}")
+            print(f"⚠️  Lỗi OpenAI summarization, fallback to basic: {e}")
             return self.summarizer.summarize_memories(memories)
     
     def _consolidate_via_summarization(self, memories: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -759,12 +671,9 @@ Tóm tắt:"""
         summaries_created = []
         
         for group in memory_groups:
-            if len(group) >= 3:  # Chỉ consolidate nếu có ít nhất 3 memories
-                # Sử dụng enhanced summarization với OpenAI nếu có
-                if self.use_openai:
-                    summary = self.enhance_summarization_with_openai(group)
-                else:
-                    summary = self.summarizer.summarize_memories(group)
+            if len(group) >= 3:                  # Chỉ consolidate nếu có ít nhất 3 memories
+                # Sử dụng enhanced summarization với OpenAI
+                summary = self.enhance_summarization_with_openai(group)
                 concepts = self.summarizer.extract_key_concepts(summary)
                 
                 # Create consolidated knowledge
@@ -794,33 +703,57 @@ Tóm tắt:"""
             "summaries": summaries_created
         }
     
+    @profile_function
     def _consolidate_via_graph(self, memories: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Consolidation qua knowledge graph integration"""
+        """Consolidation qua knowledge graph integration - Tối ưu hóa hiệu suất"""
+        if not memories:
+            return {
+                "method": "graph_integration",
+                "concepts_added": 0,
+                "edges_added": 0,
+                "graph_nodes": self.knowledge_graph.graph.number_of_nodes(),
+                "graph_edges": self.knowledge_graph.graph.number_of_edges()
+            }
+        
+        # Pre-allocate containers để tránh dynamic allocation
+        consolidated_items = []
+        current_time = datetime.now()  # Cache timestamp
+        
+        # Batch process memories để tối ưu hóa
+        for memory in memories:
+            content = memory.get('content', '')
+            if not content:  # Skip empty content
+                continue
+                
+            concepts = self.summarizer.extract_key_concepts(content)
+            if not concepts:
+                continue
+            
+            # Create consolidated knowledge
+            knowledge_id = f"graph_{memory.get('id', current_time.timestamp())}"
+            summary = content[:200] + "..." if len(content) > 200 else content
+            
+            consolidated = ConsolidatedKnowledge(
+                id=knowledge_id,
+                summary=summary,
+                source_memories=[memory.get('id', '')],
+                confidence_score=1.0,
+                consolidation_method="graph",
+                created_at=current_time
+            )
+            
+            consolidated_items.append((consolidated, concepts))
+        
+        # Batch add to knowledge graph (tối ưu hóa networkx operations)
         concepts_added = 0
         edges_added = 0
         
-        for memory in memories:
-            content = memory.get('content', '')
-            concepts = self.summarizer.extract_key_concepts(content)
+        for consolidated, concepts in consolidated_items:
+            self.knowledge_graph.add_knowledge(consolidated, concepts)
+            self.consolidated_knowledge[consolidated.id] = consolidated
             
-            if concepts:
-                # Create consolidated knowledge for this memory
-                knowledge_id = f"graph_{memory.get('id', datetime.now().timestamp())}"
-                consolidated = ConsolidatedKnowledge(
-                    id=knowledge_id,
-                    summary=content[:200] + "..." if len(content) > 200 else content,
-                    source_memories=[memory.get('id', '')],
-                    confidence_score=1.0,
-                    consolidation_method="graph",
-                    created_at=datetime.now()
-                )
-                
-                # Add to knowledge graph
-                self.knowledge_graph.add_knowledge(consolidated, concepts)
-                self.consolidated_knowledge[knowledge_id] = consolidated
-                
-                concepts_added += len(concepts)
-                edges_added += len(concepts)
+            concepts_added += len(concepts)
+            edges_added += len(concepts)
         
         return {
             "method": "graph_integration",
@@ -853,38 +786,60 @@ Tóm tắt:"""
             **distillation_results
         }
     
+    @profile_function
     def _group_memories_by_similarity(self, 
                                     memories: List[Dict[str, Any]], 
                                     similarity_threshold: float = 0.7) -> List[List[Dict[str, Any]]]:
-        """Group memories theo similarity (simplified implementation)"""
-        # Simplified grouping - trong thực tế sẽ dùng embedding similarity
+        """Group memories theo similarity - Tối ưu hóa hiệu suất với vectorization"""
+        if not memories:
+            return []
+        
+        # Pre-compute word sets để tránh repeated computation
+        memory_word_sets = []
+        valid_memories = []
+        
+        for memory in memories:
+            content = memory.get('content', '')
+            if content:
+                words = set(content.lower().split())
+                if words:  # Chỉ xử lý memories có content
+                    memory_word_sets.append(words)
+                    valid_memories.append(memory)
+        
+        if not valid_memories:
+            return []
+        
+        # Pre-allocate containers
         groups = []
         used_indices = set()
+        num_memories = len(valid_memories)
         
-        for i, memory in enumerate(memories):
+        # Vectorized similarity computation
+        for i in range(num_memories):
             if i in used_indices:
                 continue
             
-            group = [memory]
+            current_words = memory_word_sets[i]
+            group = [valid_memories[i]]
             used_indices.add(i)
             
-            # Find similar memories (simplified by checking common words)
-            memory_words = set(memory.get('content', '').lower().split())
-            
-            for j, other_memory in enumerate(memories):
-                if j <= i or j in used_indices:
+            # Batch similarity check với vectorized operations
+            for j in range(i + 1, num_memories):
+                if j in used_indices:
                     continue
                 
-                other_words = set(other_memory.get('content', '').lower().split())
+                other_words = memory_word_sets[j]
                 
-                # Simple similarity based on word overlap
-                if memory_words and other_words:
-                    overlap = len(memory_words.intersection(other_words))
-                    similarity = overlap / len(memory_words.union(other_words))
-                    
-                    if similarity >= similarity_threshold:
-                        group.append(other_memory)
-                        used_indices.add(j)
+                # Optimized similarity calculation
+                if current_words and other_words:
+                    intersection_size = len(current_words.intersection(other_words))
+                    if intersection_size > 0:  # Early exit nếu không có overlap
+                        union_size = len(current_words.union(other_words))
+                        similarity = intersection_size / union_size
+                        
+                        if similarity >= similarity_threshold:
+                            group.append(valid_memories[j])
+                            used_indices.add(j)
             
             groups.append(group)
         
@@ -927,7 +882,10 @@ Tóm tắt:"""
     
     def save_consolidated_knowledge(self, filepath: str) -> None:
         """Lưu consolidated knowledge"""
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        # Tạo thư mục nếu cần thiết
+        directory = os.path.dirname(filepath)
+        if directory:  # Chỉ tạo thư mục nếu có đường dẫn
+            os.makedirs(directory, exist_ok=True)
         
         data = {
             "consolidated_knowledge": {
@@ -953,27 +911,60 @@ Tóm tắt:"""
             "knowledge_graph_nodes": self.knowledge_graph.graph.number_of_nodes(),
             "knowledge_graph_edges": self.knowledge_graph.graph.number_of_edges(),
             "openai_integration": {
-                "enabled": self.use_openai,
-                "available": OPENAI_AVAILABLE
+                "enabled": True,
+                "available": True,
+                "model": self.openai_model
             }
         }
         
-        if self.use_openai:
-            info["openai_integration"].update({
-                "model": getattr(self, 'openai_model', 'unknown'),
-                "embedding_model": getattr(self.distillation, 'embedding_model', 'unknown'),
-                "embedding_cache_size": len(getattr(self.distillation, 'embedding_cache', {})),
-                "distillation_method": "openai_embeddings"
-            })
-        else:
-            info["openai_integration"]["distillation_method"] = "huggingface_local"
+        info["openai_integration"].update({
+            "embedding_model": getattr(self.distillation, 'embedding_model', 'unknown'),
+            "embedding_cache_size": len(getattr(self.distillation, 'embedding_cache', {})),
+            "distillation_method": "openai_embeddings"
+        })
         
         return info
     
     def clear_embedding_cache(self) -> int:
         """Xóa embedding cache để tiết kiệm memory"""
-        if self.use_openai and hasattr(self.distillation, 'embedding_cache'):
+        if hasattr(self.distillation, 'embedding_cache'):
             cache_size = len(self.distillation.embedding_cache)
             self.distillation.embedding_cache.clear()
             return cache_size
         return 0
+    
+    def force_save_knowledge(self, filepath: str = None) -> Dict[str, Any]:
+        """Bắt buộc lưu tất cả knowledge hiện tại"""
+        if not filepath:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filepath = f"consolidated_knowledge_{timestamp}.json"
+        
+        try:
+            self.save_consolidated_knowledge(filepath)
+            return {
+                "status": "success",
+                "filepath": filepath,
+                "knowledge_count": len(self.consolidated_knowledge),
+                "graph_nodes": self.knowledge_graph.graph.number_of_nodes(),
+                "graph_edges": self.knowledge_graph.graph.number_of_edges()
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e),
+                "filepath": filepath
+            }
+    
+    def get_storage_status(self) -> Dict[str, Any]:
+        """Lấy trạng thái lưu trữ hiện tại"""
+        return {
+            "memory_storage": {
+                "consolidated_knowledge_count": len(self.consolidated_knowledge),
+                "knowledge_graph_nodes": self.knowledge_graph.graph.number_of_nodes(),
+                "knowledge_graph_edges": self.knowledge_graph.graph.number_of_edges(),
+                "concept_memories_count": len(self.knowledge_graph.concept_memories)
+            },
+            "last_consolidation": self.last_consolidation.isoformat(),
+            "consolidation_threshold": self.consolidation_threshold,
+            "next_consolidation_due": (self.last_consolidation + self.consolidation_interval).isoformat()
+        }

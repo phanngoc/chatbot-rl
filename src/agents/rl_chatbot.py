@@ -14,20 +14,23 @@ import openai
 import os
 from openai import OpenAI
 
+# Fix tokenizers parallelism issue
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 # Import các components đã implement
-from ..core.experience_replay import ExperienceReplayBuffer, Experience, ExperienceReplayTrainer
-from ..memory.retrieval_memory import RetrievalAugmentedMemory
-from ..memory.consolidation import MemoryConsolidationSystem
-from ..core.ewc import MultiTaskEWC
-from ..core.meta_learning import MetaLearningEpisodicSystem
-from ..core.temporal_weighting import TemporalWeightingSystem
+from core.experience_replay import ExperienceReplayBuffer, Experience, ExperienceReplayTrainer
+from memory.retrieval_memory import RetrievalAugmentedMemory
+from memory.consolidation import MemoryConsolidationSystem
+from core.ewc import MultiTaskEWC
+from core.meta_learning import MetaLearningEpisodicSystem
+from core.temporal_weighting import TemporalWeightingSystem
 
 
 class RLChatbotModel:
     """OpenAI-based model cho RL Chatbot"""
     
     def __init__(self, 
-                 openai_model: str = "gpt-3.5-turbo",
+                 openai_model: str = "gpt-4o-mini",
                  api_key: str = None,
                  hidden_size: int = 768,
                  memory_dim: int = 256,
@@ -79,22 +82,49 @@ class RLChatbotModel:
     def estimate_value(self, text: str, memory_context: torch.Tensor = None) -> float:
         """Estimate value cho RL từ text representation"""
         
-        # Get text representation
-        text_embedding = self.get_embedding_representation(text)
-        
-        # Process memory context nếu có
-        if memory_context is not None:
-            memory_processed = self.memory_processor(memory_context.to(self.device))
-            # Combine text embedding với memory context
-            combined_input = text_embedding + memory_processed.mean(dim=1)  # Simple combination
-        else:
-            combined_input = text_embedding
-        
-        # Estimate value
-        with torch.no_grad():
-            value = self.value_estimator(combined_input)
-        
-        return value.item()
+        try:
+            # Get text representation
+            text_embedding = self.get_embedding_representation(text)
+            
+            # Process memory context nếu có
+            if memory_context is not None:
+                try:
+                    # Ensure memory_context is on correct device and has correct shape
+                    memory_context = memory_context.to(self.device)
+                    
+                    # Validate dimensions before processing
+                    if memory_context.dim() == 3 and memory_context.shape[2] == self.memory_dim:
+                        memory_processed = self.memory_processor(memory_context)
+                        
+                        # Ensure proper shape for combination
+                        if memory_processed.shape[1] == text_embedding.shape[1]:
+                            combined_input = text_embedding + memory_processed.mean(dim=1)
+                        else:
+                            # Reshape if needed
+                            memory_processed = memory_processed.mean(dim=1).unsqueeze(0)
+                            if memory_processed.shape[1] == text_embedding.shape[1]:
+                                combined_input = text_embedding + memory_processed
+                            else:
+                                combined_input = text_embedding
+                    else:
+                        self.logger.warning(f"Invalid memory context shape: {memory_context.shape}")
+                        combined_input = text_embedding
+                        
+                except Exception as e:
+                    self.logger.warning(f"Memory processing failed: {e}")
+                    combined_input = text_embedding
+            else:
+                combined_input = text_embedding
+            
+            # Estimate value
+            with torch.no_grad():
+                value = self.value_estimator(combined_input)
+            
+            return value.item()
+            
+        except Exception as e:
+            self.logger.error(f"Value estimation failed: {e}")
+            return 0.0  # Default neutral value
     
     def generate_response(self, 
                          input_text: str,
@@ -176,9 +206,57 @@ class RLChatbotModel:
         if memory_context is None:
             return ""
         
-        # Simple formatting - trong thực tế sẽ có logic phức tạp hơn
-        memory_size = memory_context.shape[1] if len(memory_context.shape) > 1 else 1
-        return f"Có {memory_size} memories liên quan được tìm thấy từ các cuộc hội thoại trước."
+        try:
+            # Validate tensor shape and dimensions
+            if memory_context.dim() == 3:
+                batch_size, num_memories, memory_dim = memory_context.shape
+                if memory_dim == self.memory_dim:
+                    return f"Có {num_memories} memories liên quan được tìm thấy từ các cuộc hội thoại trước."
+                else:
+                    self.logger.warning(f"Memory dimension mismatch: expected {self.memory_dim}, got {memory_dim}")
+                    return f"Có memories liên quan được tìm thấy từ các cuộc hội thoại trước."
+            elif memory_context.dim() == 2:
+                num_memories, memory_dim = memory_context.shape
+                return f"Có {num_memories} memories liên quan được tìm thấy từ các cuộc hội thoại trước."
+            else:
+                return "Có memories liên quan được tìm thấy từ các cuộc hội thoại trước."
+                
+        except (IndexError, AttributeError) as e:
+            self.logger.warning(f"Error formatting memory context: {e}")
+            return "Có memories liên quan được tìm thấy từ các cuộc hội thoại trước."
+    
+    def _validate_tensor_dimensions(self, tensor: torch.Tensor, expected_dims: Tuple[int, ...]) -> bool:
+        """Validate tensor dimensions"""
+        try:
+            if tensor.shape != expected_dims:
+                self.logger.warning(f"Tensor dimension mismatch: expected {expected_dims}, got {tensor.shape}")
+                return False
+            return True
+        except Exception as e:
+            self.logger.warning(f"Tensor validation failed: {e}")
+            return False
+    
+    def parameters(self):
+        """Trả về iterator của tất cả parameters trong neural components"""
+        # Combine parameters từ tất cả neural components
+        params = []
+        params.extend(self.value_estimator.parameters())
+        params.extend(self.memory_processor.parameters())
+        return iter(params)
+    
+    def named_parameters(self):
+        """Trả về iterator của tất cả named parameters trong neural components"""
+        named_params = []
+        
+        # Value estimator parameters
+        for name, param in self.value_estimator.named_parameters():
+            named_params.append((f"value_estimator.{name}", param))
+        
+        # Memory processor parameters
+        for name, param in self.memory_processor.named_parameters():
+            named_params.append((f"memory_processor.{name}", param))
+        
+        return iter(named_params)
 
 
 class RLChatbotAgent:
@@ -253,7 +331,7 @@ class RLChatbotAgent:
             input_size=768,
             hidden_size=256,
             memory_size=self.config.get("meta_memory_size", 1000),
-            memory_dim=128,
+            memory_dim=256,  # Fixed: match with hidden_size
             output_size=768
         )
         
@@ -357,30 +435,56 @@ class RLChatbotAgent:
         # Retrieve từ different memory systems
         memories = []
         
-        # 1. Retrieval-Augmented Memory
-        ram_memories = self.retrieval_memory.retrieve_relevant_memories(
-            query, top_k=3
-        )
-        memories.extend(ram_memories)
+        try:
+            # 1. Retrieval-Augmented Memory
+            if hasattr(self.retrieval_memory, 'retrieve_relevant_memories'):
+                ram_memories = self.retrieval_memory.retrieve_relevant_memories(
+                    query, top_k=3
+                )
+                if ram_memories:
+                    memories.extend(ram_memories)
+        except Exception as e:
+            self.logger.warning(f"Failed to retrieve from RAM: {e}")
         
-        # 2. Meta-learning system
-        meta_memories = self.meta_learning_system.select_relevant_memories(
-            query, context, top_k=2
-        )
-        memories.extend(meta_memories)
+        try:
+            # 2. Meta-learning system
+            if hasattr(self.meta_learning_system, 'select_relevant_memories'):
+                meta_memories = self.meta_learning_system.select_relevant_memories(
+                    query, context, top_k=2
+                )
+                if meta_memories:
+                    # Ensure proper format and dimensions
+                    for memory in meta_memories:
+                        if isinstance(memory, dict) and 'content' in memory:
+                            memories.append(memory)
+                        else:
+                            # Convert to proper format if needed
+                            memories.append({
+                                "content": str(memory) if memory else "",
+                                "context": context,
+                                "weight": 1.0,
+                                "source": "meta_learning"
+                            })
+        except Exception as e:
+            self.logger.warning(f"Failed to retrieve from meta-learning: {e}")
+            # Continue without meta-learning memories
         
-        # 3. Temporal weighted experiences
-        weighted_experiences = self.temporal_weighting.get_weighted_experiences(
-            top_k=5, min_weight=0.3
-        )
-        
-        for exp in weighted_experiences[:2]:  # Take top 2
-            memories.append({
-                "content": exp.content,
-                "context": exp.context,
-                "weight": exp.get_combined_weight(),
-                "source": "temporal_weighting"
-            })
+        try:
+            # 3. Temporal weighted experiences
+            if hasattr(self.temporal_weighting, 'get_weighted_experiences'):
+                weighted_experiences = self.temporal_weighting.get_weighted_experiences(
+                    top_k=5, min_weight=0.3
+                )
+                
+                for exp in weighted_experiences[:2]:  # Take top 2
+                    memories.append({
+                        "content": exp.content,
+                        "context": exp.context,
+                        "weight": exp.get_combined_weight(),
+                        "source": "temporal_weighting"
+                    })
+        except Exception as e:
+            self.logger.warning(f"Failed to retrieve from temporal weighting: {e}")
         
         self.performance_metrics["memory_retrievals"] += 1
         
@@ -393,11 +497,23 @@ class RLChatbotAgent:
         
         # Prepare memory context tensor
         memory_context = None
-        if memories:
-            # Trong thực tế sẽ convert memories thành proper embeddings
-            # Ở đây chỉ mock một tensor
-            memory_dim = 256
-            memory_context = torch.randn(1, len(memories), memory_dim)
+        if memories and len(memories) > 0:
+            try:
+                # Ensure consistent dimensions
+                memory_dim = 256  # Match with model's memory_dim
+                num_memories = min(len(memories), 5)  # Limit to prevent dimension issues
+                
+                # Create properly shaped tensor
+                memory_context = torch.randn(1, num_memories, memory_dim)
+                
+                # Validate tensor shape
+                if memory_context.shape[1] != num_memories or memory_context.shape[2] != memory_dim:
+                    self.logger.warning(f"Memory context shape mismatch: {memory_context.shape}")
+                    memory_context = None
+                    
+            except Exception as e:
+                self.logger.warning(f"Failed to create memory context tensor: {e}")
+                memory_context = None
         
         # Generate response using OpenAI API
         response_data = self.model.generate_response(
@@ -436,47 +552,63 @@ class RLChatbotAgent:
             reward = 0.0
         
         # 1. Store trong Experience Replay Buffer
-        experience = Experience(
-            state=f"{context} {user_message}".strip(),
-            action=bot_response,
-            reward=reward,
-            next_state="",  # Will be filled by next interaction
-            timestamp=timestamp,
-            conversation_id=self.current_conversation_id,
-            user_feedback=str(user_feedback) if user_feedback is not None else None
-        )
-        self.experience_buffer.add_experience(experience)
+        try:
+            experience = Experience(
+                state=f"{context} {user_message}".strip(),
+                action=bot_response,
+                reward=reward,
+                next_state="",  # Will be filled by next interaction
+                timestamp=timestamp,
+                conversation_id=self.current_conversation_id,
+                user_feedback=str(user_feedback) if user_feedback is not None else None
+            )
+            if hasattr(self.experience_buffer, 'add_experience'):
+                self.experience_buffer.add_experience(experience)
+        except Exception as e:
+            self.logger.warning(f"Failed to store in experience buffer: {e}")
         
         # 2. Store trong Retrieval Memory
-        memory_id = self.retrieval_memory.add_memory(
-            content=bot_response,
-            context=f"{context} {user_message}".strip(),
-            tags=["conversation", "response"],
-            importance_score=1.0 + abs(reward),
-            metadata={
-                "conversation_id": self.current_conversation_id,
-                "user_feedback": user_feedback,
-                "experience_id": experience_id
-            }
-        )
+        try:
+            if hasattr(self.retrieval_memory, 'add_memory'):
+                memory_id = self.retrieval_memory.add_memory(
+                    content=bot_response,
+                    context=f"{context} {user_message}".strip(),
+                    tags=["conversation", "response"],
+                    importance_score=1.0 + abs(reward),
+                    metadata={
+                        "conversation_id": self.current_conversation_id,
+                        "user_feedback": user_feedback,
+                        "experience_id": experience_id
+                    }
+                )
+        except Exception as e:
+            self.logger.warning(f"Failed to store in retrieval memory: {e}")
         
         # 3. Store trong Meta-learning System
-        self.meta_learning_system.store_episodic_experience(
-            context=f"{context} {user_message}".strip(),
-            response=bot_response,
-            reward=reward,
-            user_feedback=str(user_feedback) if user_feedback is not None else None
-        )
+        try:
+            if hasattr(self.meta_learning_system, 'store_episodic_experience'):
+                self.meta_learning_system.store_episodic_experience(
+                    context=f"{context} {user_message}".strip(),
+                    response=bot_response,
+                    reward=reward,
+                    user_feedback=str(user_feedback) if user_feedback is not None else None
+                )
+        except Exception as e:
+            self.logger.warning(f"Failed to store in meta-learning system: {e}")
         
         # 4. Store trong Temporal Weighting System
-        self.temporal_weighting.add_experience(
-            experience_id=experience_id,
-            content=bot_response,
-            context=f"{context} {user_message}".strip(),
-            reward=reward,
-            tags=["conversation", "response"],
-            source="user_interaction"
-        )
+        try:
+            if hasattr(self.temporal_weighting, 'add_experience'):
+                self.temporal_weighting.add_experience(
+                    experience_id=experience_id,
+                    content=bot_response,
+                    context=f"{context} {user_message}".strip(),
+                    reward=reward,
+                    tags=["conversation", "response"],
+                    source="user_interaction"
+                )
+        except Exception as e:
+            self.logger.warning(f"Failed to store in temporal weighting: {e}")
         
         return experience_id
     
@@ -485,60 +617,78 @@ class RLChatbotAgent:
                                   user_feedback: Optional[float] = None):
         """Update performance metrics"""
         
-        # Response time
-        response_time = (datetime.now() - start_time).total_seconds()
-        self.performance_metrics["avg_response_time"] = (
-            (self.performance_metrics["avg_response_time"] * self.performance_metrics["total_interactions"] + 
-             response_time) / (self.performance_metrics["total_interactions"] + 1)
-        )
-        
-        # Interaction count
-        self.performance_metrics["total_interactions"] += 1
-        
-        # Feedback tracking
-        if user_feedback is not None:
-            if user_feedback > 0.5:
-                self.performance_metrics["positive_feedback"] += 1
-            elif user_feedback < -0.5:
-                self.performance_metrics["negative_feedback"] += 1
+        try:
+            # Response time
+            response_time = (datetime.now() - start_time).total_seconds()
+            self.performance_metrics["avg_response_time"] = (
+                (self.performance_metrics["avg_response_time"] * self.performance_metrics["total_interactions"] + 
+                 response_time) / (self.performance_metrics["total_interactions"] + 1)
+            )
+            
+            # Interaction count
+            self.performance_metrics["total_interactions"] += 1
+            
+            # Feedback tracking
+            if user_feedback is not None:
+                if user_feedback > 0.5:
+                    self.performance_metrics["positive_feedback"] += 1
+                elif user_feedback < -0.5:
+                    self.performance_metrics["negative_feedback"] += 1
+        except Exception as e:
+            self.logger.warning(f"Failed to update performance metrics: {e}")
     
     def _check_and_run_consolidation(self):
         """Kiểm tra và chạy memory consolidation nếu cần"""
         
-        num_new_memories = len(self.experience_buffer.buffer)
-        
-        if self.consolidation_system.should_consolidate(num_new_memories):
-            self.logger.info("Chạy memory consolidation...")
+        try:
+            if not hasattr(self.experience_buffer, 'buffer'):
+                return
+                
+            num_new_memories = len(self.experience_buffer.buffer)
             
-            # Prepare memories cho consolidation
-            experiences_for_consolidation = []
-            for exp in list(self.experience_buffer.buffer)[-200:]:  # Recent 200
-                experiences_for_consolidation.append({
-                    "id": str(uuid.uuid4()),
-                    "content": exp.action,
-                    "context": exp.state,
-                    "reward": exp.reward,
-                    "timestamp": exp.timestamp
-                })
-            
-            # Run consolidation
-            consolidation_results = self.consolidation_system.consolidate_memories(
-                experiences_for_consolidation,
-                method="all"
-            )
-            
-            self.performance_metrics["consolidation_runs"] += 1
-            self.logger.info(f"Consolidation completed: {consolidation_results}")
+            if self.consolidation_system.should_consolidate(num_new_memories):
+                self.logger.info("Chạy memory consolidation...")
+                
+                # Prepare memories cho consolidation
+                experiences_for_consolidation = []
+                for exp in list(self.experience_buffer.buffer)[-200:]:  # Recent 200
+                    experiences_for_consolidation.append({
+                        "id": str(uuid.uuid4()),
+                        "content": exp.action,
+                        "context": exp.state,
+                        "reward": exp.reward,
+                        "timestamp": exp.timestamp
+                    })
+                
+                # Run consolidation
+                consolidation_results = self.consolidation_system.consolidate_memories(
+                    experiences_for_consolidation,
+                    method="all"
+                )
+                
+                self.performance_metrics["consolidation_runs"] += 1
+                self.logger.info(f"Consolidation completed: {consolidation_results}")
+        except Exception as e:
+            self.logger.warning(f"Memory consolidation failed: {e}")
     
     def _get_memory_stats(self) -> Dict[str, Any]:
         """Lấy statistics từ tất cả memory systems"""
         
-        return {
-            "experience_buffer": self.experience_buffer.get_statistics(),
-            "retrieval_memory": self.retrieval_memory.get_memory_statistics(),
-            "temporal_weighting": self.temporal_weighting.get_weight_statistics(),
-            "meta_learning": self.meta_learning_system.get_system_statistics()
-        }
+        try:
+            return {
+                "experience_buffer": self.experience_buffer.get_statistics() if hasattr(self.experience_buffer, 'get_statistics') else {"error": "Not available"},
+                "retrieval_memory": self.retrieval_memory.get_memory_statistics() if hasattr(self.retrieval_memory, 'get_memory_statistics') else {"error": "Not available"},
+                "temporal_weighting": self.temporal_weighting.get_weight_statistics() if hasattr(self.temporal_weighting, 'get_weight_statistics') else {"error": "Not available"},
+                "meta_learning": self.meta_learning_system.get_system_statistics() if hasattr(self.meta_learning_system, 'get_system_statistics') else {"error": "Not available"}
+            }
+        except Exception as e:
+            self.logger.warning(f"Error getting memory stats: {e}")
+            return {
+                "experience_buffer": {"error": str(e)},
+                "retrieval_memory": {"error": str(e)},
+                "temporal_weighting": {"error": str(e)},
+                "meta_learning": {"error": str(e)}
+            }
     
     def provide_feedback(self, 
                         experience_id: str,
@@ -548,22 +698,28 @@ class RLChatbotAgent:
         
         success = True
         
-        # Update trong Experience Buffer
-        for conv_id, experiences in self.experience_buffer.conversation_history.items():
-            for i, exp in enumerate(experiences):
-                if hasattr(exp, 'id') and exp.id == experience_id:
-                    success &= self.experience_buffer.update_experience_reward(
-                        conv_id, i, feedback_score, feedback_text
-                    )
-        
-        # Update trong Temporal Weighting System
-        success &= self.temporal_weighting.update_experience_feedback(
-            experience_id, feedback_score
-        )
-        
-        # Trigger learning từ feedback
-        if abs(feedback_score) > 0.5:  # Strong feedback
-            self._trigger_learning_from_feedback(experience_id, feedback_score)
+        try:
+            # Update trong Experience Buffer
+            if hasattr(self.experience_buffer, 'conversation_history'):
+                for conv_id, experiences in self.experience_buffer.conversation_history.items():
+                    for i, exp in enumerate(experiences):
+                        if hasattr(exp, 'id') and exp.id == experience_id:
+                            success &= self.experience_buffer.update_experience_reward(
+                                conv_id, i, feedback_score, feedback_text
+                            )
+            
+            # Update trong Temporal Weighting System
+            if hasattr(self.temporal_weighting, 'update_experience_feedback'):
+                success &= self.temporal_weighting.update_experience_feedback(
+                    experience_id, feedback_score
+                )
+            
+            # Trigger learning từ feedback
+            if abs(feedback_score) > 0.5:  # Strong feedback
+                self._trigger_learning_from_feedback(experience_id, feedback_score)
+        except Exception as e:
+            self.logger.warning(f"Error providing feedback: {e}")
+            success = False
         
         return success
     
@@ -573,17 +729,23 @@ class RLChatbotAgent:
         """Trigger learning khi có strong feedback"""
         
         # Experience replay training
-        if len(self.experience_buffer.buffer) >= 32:
-            training_results = self.replay_trainer.replay_training_step(
-                batch_size=16,
-                num_epochs=1
-            )
-            self.logger.info(f"Feedback-triggered training: {training_results}")
+        try:
+            if hasattr(self.experience_buffer, 'buffer') and len(self.experience_buffer.buffer) >= 32:
+                training_results = self.replay_trainer.replay_training_step(
+                    batch_size=16,
+                    num_epochs=1
+                )
+                self.logger.info(f"Feedback-triggered training: {training_results}")
+        except Exception as e:
+            self.logger.warning(f"Feedback-triggered training failed: {e}")
         
         # Meta-learning session (nếu có đủ data)
-        if len(self.meta_learning_system.experience_buffer) >= 20:
-            meta_results = self.meta_learning_system.meta_learning_session(num_episodes=5)
-            self.logger.info(f"Meta-learning session: {meta_results.get('avg_query_loss', 'N/A')}")
+        try:
+            if hasattr(self.meta_learning_system, 'experience_buffer') and len(self.meta_learning_system.experience_buffer) >= 20:
+                meta_results = self.meta_learning_system.meta_learning_session(num_episodes=5)
+                self.logger.info(f"Meta-learning session: {meta_results.get('avg_query_loss', 'N/A')}")
+        except Exception as e:
+            self.logger.warning(f"Meta-learning session failed: {e}")
     
     def get_conversation_summary(self) -> Dict[str, Any]:
         """Lấy summary của conversation hiện tại"""
@@ -608,8 +770,8 @@ class RLChatbotAgent:
                 "model_name": "RLChatbot with OpenAI",
                 "openai_model": self.model.openai_model,
                 "device": self.device,
-                "neural_parameters": sum(p.numel() for p in self.model.value_estimator.parameters()) + 
-                                   sum(p.numel() for p in self.model.memory_processor.parameters()),
+                "neural_parameters": (sum(p.numel() for p in self.model.value_estimator.parameters()) if hasattr(self.model, 'value_estimator') else 0) + 
+                                   (sum(p.numel() for p in self.model.memory_processor.parameters()) if hasattr(self.model, 'memory_processor') else 0),
                 "max_tokens": self.model.max_tokens,
                 "temperature": self.model.temperature
             },
@@ -617,9 +779,9 @@ class RLChatbotAgent:
             "memory_systems": self._get_memory_stats(),
             "current_conversation": self.current_conversation_id,
             "system_health": {
-                "experience_buffer_utilization": len(self.experience_buffer.buffer) / self.experience_buffer.max_size * 100,
+                "experience_buffer_utilization": (len(getattr(self.experience_buffer, 'buffer', [])) / getattr(self.experience_buffer, 'max_size', 1)) * 100 if hasattr(self.experience_buffer, 'buffer') and hasattr(self.experience_buffer, 'max_size') else 0.0,
                 "memory_consolidation_status": "active" if self.consolidation_system else "inactive",
-                "meta_learning_episodes": self.meta_learning_system.meta_learning_stats.get("episodes_trained", 0)
+                "meta_learning_episodes": getattr(self.meta_learning_system, 'meta_learning_stats', {}).get("episodes_trained", 0)
             }
         }
     
@@ -629,24 +791,59 @@ class RLChatbotAgent:
         try:
             # Save model configuration và neural components
             model_path = filepath.replace('.json', '_model.pt')
-            torch.save({
-                'value_estimator_state_dict': self.model.value_estimator.state_dict(),
-                'memory_processor_state_dict': self.model.memory_processor.state_dict(),
+            model_state = {
                 'openai_model': self.model.openai_model,
                 'max_tokens': self.model.max_tokens,
                 'temperature': self.model.temperature,
                 'hidden_size': self.model.hidden_size,
                 'memory_dim': self.model.memory_dim,
                 'config': self.config
-            }, model_path)
+            }
+            
+            # Add neural components if available
+            if hasattr(self.model, 'value_estimator'):
+                model_state['value_estimator_state_dict'] = self.model.value_estimator.state_dict()
+            if hasattr(self.model, 'memory_processor'):
+                model_state['memory_processor_state_dict'] = self.model.memory_processor.state_dict()
+            
+            torch.save(model_state, model_path)
             
             # Save all systems
-            self.experience_buffer.save_buffer()
-            self.retrieval_memory.save_memories(filepath.replace('.json', '_retrieval_memories.json'))
-            self.consolidation_system.save_consolidated_knowledge(filepath.replace('.json', '_consolidated_knowledge.json'))
-            self.ewc_system.save_ewc_data(filepath.replace('.json', '_ewc_data.pkl'))
-            self.meta_learning_system.save_system(filepath.replace('.json', '_meta_learning.pt'))
-            self.temporal_weighting.save_system(filepath.replace('.json', '_temporal_weights.json'))
+            try:
+                if hasattr(self.experience_buffer, 'save_buffer'):
+                    self.experience_buffer.save_buffer()
+            except Exception as e:
+                self.logger.warning(f"Failed to save experience buffer: {e}")
+                
+            try:
+                if hasattr(self.retrieval_memory, 'save_memories'):
+                    self.retrieval_memory.save_memories(filepath.replace('.json', '_retrieval_memories.json'))
+            except Exception as e:
+                self.logger.warning(f"Failed to save retrieval memory: {e}")
+                
+            try:
+                if hasattr(self.consolidation_system, 'save_consolidated_knowledge'):
+                    self.consolidation_system.save_consolidated_knowledge(filepath.replace('.json', '_consolidated_knowledge.json'))
+            except Exception as e:
+                self.logger.warning(f"Failed to save consolidation system: {e}")
+                
+            try:
+                if hasattr(self.ewc_system, 'save_ewc_data'):
+                    self.ewc_system.save_ewc_data(filepath.replace('.json', '_ewc_data.pkl'))
+            except Exception as e:
+                self.logger.warning(f"Failed to save EWC system: {e}")
+                
+            try:
+                if hasattr(self.meta_learning_system, 'save_system'):
+                    self.meta_learning_system.save_system(filepath.replace('.json', '_meta_learning.pt'))
+            except Exception as e:
+                self.logger.warning(f"Failed to save meta-learning system: {e}")
+                
+            try:
+                if hasattr(self.temporal_weighting, 'save_system'):
+                    self.temporal_weighting.save_system(filepath.replace('.json', '_temporal_weights.json'))
+            except Exception as e:
+                self.logger.warning(f"Failed to save temporal weighting: {e}")
             
             # Save agent state
             agent_state = {
@@ -676,27 +873,54 @@ class RLChatbotAgent:
             # Load model
             model_path = filepath.replace('.json', '_model.pt')
             if os.path.exists(model_path):
-                checkpoint = torch.load(model_path, map_location=self.device)
-                # Load neural components
-                if 'value_estimator_state_dict' in checkpoint:
-                    self.model.value_estimator.load_state_dict(checkpoint['value_estimator_state_dict'])
-                if 'memory_processor_state_dict' in checkpoint:
-                    self.model.memory_processor.load_state_dict(checkpoint['memory_processor_state_dict'])
-                # Update model config
-                if 'openai_model' in checkpoint:
-                    self.model.openai_model = checkpoint['openai_model']
-                if 'max_tokens' in checkpoint:
-                    self.model.max_tokens = checkpoint['max_tokens']
-                if 'temperature' in checkpoint:
-                    self.model.temperature = checkpoint['temperature']
-                self.config.update(checkpoint.get('config', {}))
+                try:
+                    checkpoint = torch.load(model_path, map_location=self.device)
+                    # Load neural components
+                    if 'value_estimator_state_dict' in checkpoint and hasattr(self.model, 'value_estimator'):
+                        self.model.value_estimator.load_state_dict(checkpoint['value_estimator_state_dict'])
+                    if 'memory_processor_state_dict' in checkpoint and hasattr(self.model, 'memory_processor'):
+                        self.model.memory_processor.load_state_dict(checkpoint['memory_processor_state_dict'])
+                    # Update model config
+                    if 'openai_model' in checkpoint:
+                        self.model.openai_model = checkpoint['openai_model']
+                    if 'max_tokens' in checkpoint:
+                        self.model.max_tokens = checkpoint['max_tokens']
+                    if 'temperature' in checkpoint:
+                        self.model.temperature = checkpoint['temperature']
+                    self.config.update(checkpoint.get('config', {}))
+                except Exception as e:
+                    self.logger.warning(f"Failed to load model checkpoint: {e}")
             
             # Load all systems
-            self.experience_buffer.load_buffer()
-            self.retrieval_memory.load_memories(filepath.replace('.json', '_retrieval_memories.json'))
-            self.ewc_system.load_ewc_data(filepath.replace('.json', '_ewc_data.pkl'))
-            self.meta_learning_system.load_system(filepath.replace('.json', '_meta_learning.pt'))
-            self.temporal_weighting.load_system(filepath.replace('.json', '_temporal_weights.json'))
+            try:
+                if hasattr(self.experience_buffer, 'load_buffer'):
+                    self.experience_buffer.load_buffer()
+            except Exception as e:
+                self.logger.warning(f"Failed to load experience buffer: {e}")
+                
+            try:
+                if hasattr(self.retrieval_memory, 'load_memories'):
+                    self.retrieval_memory.load_memories(filepath.replace('.json', '_retrieval_memories.json'))
+            except Exception as e:
+                self.logger.warning(f"Failed to load retrieval memory: {e}")
+                
+            try:
+                if hasattr(self.ewc_system, 'load_ewc_data'):
+                    self.ewc_system.load_ewc_data(filepath.replace('.json', '_ewc_data.pkl'))
+            except Exception as e:
+                self.logger.warning(f"Failed to load EWC system: {e}")
+                
+            try:
+                if hasattr(self.meta_learning_system, 'load_system'):
+                    self.meta_learning_system.load_system(filepath.replace('.json', '_meta_learning.pt'))
+            except Exception as e:
+                self.logger.warning(f"Failed to load meta-learning system: {e}")
+                
+            try:
+                if hasattr(self.temporal_weighting, 'load_system'):
+                    self.temporal_weighting.load_system(filepath.replace('.json', '_temporal_weights.json'))
+            except Exception as e:
+                self.logger.warning(f"Failed to load temporal weighting: {e}")
             
             # Load agent state
             if os.path.exists(filepath):

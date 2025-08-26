@@ -9,14 +9,16 @@ pip install -r requirements.txt
 
 ### 2. Setup OpenAI API Key
 ```bash
-# Tạo file .env hoặc export environment variable
-export OPENAI_API_KEY="your-openai-api-key-here"
+# Tạo file .env từ template
+cp .env.example .env
 
-# Hoặc tạo file .env
-echo "OPENAI_API_KEY=your-openai-api-key-here" > .env
+# Chỉnh sửa file .env với API key của bạn
+# OPENAI_API_KEY=sk-your-actual-api-key-here
 ```
 
 **💡 Lấy API key từ:** https://platform.openai.com/api-keys
+
+**📝 Chi tiết thiết lập:** Xem [README_ENV.md](README_ENV.md)
 
 ### 3. Chạy demo
 ```bash
@@ -70,17 +72,18 @@ python src/main.py --mode eval --data examples/sample_training_data.json
 
 ## 🔧 Cấu hình nhanh
 
-Chỉnh sửa `configs/default.json`:
+Chỉnh sửa file `.env`:
 
-```json
-{
-  "openai_model": "gpt-3.5-turbo", // Hoặc "gpt-4" cho chất lượng tốt hơn
-  "max_tokens": 150,                // Số tokens tối đa cho response
-  "temperature": 0.8,               // Độ sáng tạo (0.1-2.0)
-  "consolidation_threshold": 50,    // Số experiences để trigger consolidation
-  "ewc_lambda": 1000.0,            // EWC regularization strength
-  "decay_function": "exponential"   // Temporal decay function
-}
+```env
+# OpenAI Configuration
+OPENAI_API_KEY=sk-your-actual-api-key-here
+OPENAI_MODEL=gpt-3.5-turbo  # Hoặc "gpt-4" cho chất lượng tốt hơn
+OPENAI_TEMPERATURE=0.8      # Độ sáng tạo (0.1-2.0)
+
+# RL Chatbot Configuration
+RL_MODEL_NAME=microsoft/DialoGPT-medium
+RL_EXPERIENCE_BUFFER_SIZE=5000
+RL_MAX_MEMORIES=2000
 ```
 
 ### 🔑 OpenAI Models Available:
@@ -97,6 +100,9 @@ echo $OPENAI_API_KEY
 
 # Test API connection
 python -c "from openai import OpenAI; print('API key works!' if OpenAI().models.list() else 'Failed')"
+
+# Hoặc sử dụng script setup
+python setup_env.py
 ```
 
 ### Common OpenAI Errors:

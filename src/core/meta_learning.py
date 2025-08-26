@@ -297,6 +297,34 @@ class MemoryAugmentedNetwork(nn.Module):
         ]
         
         self.timestep = 0
+        
+        # Add device property
+        self._device = None
+    
+    @property
+    def device(self):
+        """Get device của model"""
+        if self._device is None:
+            # Lấy device từ parameter đầu tiên
+            for param in self.parameters():
+                self._device = param.device
+                break
+            # Nếu không có parameters, default to CPU
+            if self._device is None:
+                self._device = torch.device('cpu')
+        return self._device
+    
+    def to(self, device):
+        """Move model đến device cụ thể"""
+        super().to(device)
+        self._device = device
+        
+        # Move memory bank tensors to device
+        for entry in self.memory_bank:
+            entry.key = entry.key.to(device)
+            entry.value = entry.value.to(device)
+        
+        return self
     
     def forward(self, x: torch.Tensor, retrieve_memories: bool = True) -> Tuple[torch.Tensor, List[Dict]]:
         """
@@ -363,9 +391,14 @@ class MemoryAugmentedNetwork(nn.Module):
         # Update memory entry
         importance_weight = max(0.1, min(2.0, 1.0 + reward))  # Convert reward to importance
         
+        # Ensure tensors are on the same device as the model
+        device = self.device
+        key = key.detach().to(device)
+        value = value.detach().to(device)
+        
         self.memory_bank[lru_idx] = MemoryBankEntry(
-            key=key.detach(),
-            value=value.detach(),
+            key=key,
+            value=value,
             usage_count=0,
             last_accessed=self.timestep,
             importance_weight=importance_weight
@@ -420,6 +453,13 @@ class MemoryInterface(nn.Module):
             memory_output: Combined memory output
             retrieved_info: Information về retrieved memories
         """
+        # Check if memory bank is empty
+        if not memory_bank:
+            batch_size = query_input.size(0)
+            memory_dim = self.memory_dim if hasattr(self, 'memory_dim') else 128
+            empty_output = torch.zeros(batch_size, memory_dim, device=query_input.device)
+            return empty_output, []
+        
         batch_size = query_input.size(0)
         
         # Generate query
@@ -431,10 +471,26 @@ class MemoryInterface(nn.Module):
         memory_info = []
         
         for i, entry in enumerate(memory_bank):
+            # Ensure entry.key has correct shape
+            if entry.key.dim() == 1:
+                entry_key = entry.key.unsqueeze(0)  # (1, memory_dim)
+            else:
+                entry_key = entry.key
+            
+            # Ensure query has correct shape
+            if query.dim() == 1:
+                query_expanded = query.unsqueeze(0)  # (1, memory_dim)
+            else:
+                query_expanded = query
+            
             # Cosine similarity
-            key_norm = F.normalize(entry.key.unsqueeze(0), p=2, dim=-1)
-            query_norm = F.normalize(query, p=2, dim=-1)
+            key_norm = F.normalize(entry_key, p=2, dim=-1)
+            query_norm = F.normalize(query_expanded, p=2, dim=-1)
             similarity = torch.matmul(query_norm, key_norm.t()).squeeze()  # (batch_size,)
+            
+            # Ensure similarity is 1D tensor
+            if similarity.dim() == 0:
+                similarity = similarity.unsqueeze(0)  # (1,)
             
             # Weight by importance và usage
             weighted_similarity = similarity * entry.importance_weight
@@ -448,47 +504,69 @@ class MemoryInterface(nn.Module):
                 "usage_count": entry.usage_count
             })
         
-        # Get top-k memories
-        similarities_tensor = torch.stack(similarities, dim=-1)  # (batch_size, memory_size)
-        top_k_indices = torch.topk(similarities_tensor, min(top_k, len(memory_bank)), dim=-1).indices
-        
-        # Retrieve top-k memories
-        retrieved_memories = []
-        retrieved_info = []
-        
-        for batch_idx in range(batch_size):
-            batch_memories = []
-            batch_info = []
+        # Get top-k memories với proper error handling
+        try:
+            similarities_tensor = torch.stack(similarities, dim=-1)  # (batch_size, memory_size)
             
-            for k_idx in range(min(top_k, len(memory_bank))):
-                memory_idx = top_k_indices[batch_idx, k_idx].item()
-                batch_memories.append(memory_values[memory_idx][batch_idx])
-                batch_info.append(memory_info[memory_idx])
+            # Ensure tensor has correct dimensions
+            if similarities_tensor.dim() == 1:
+                similarities_tensor = similarities_tensor.unsqueeze(0)  # (1, memory_size)
+            
+            actual_top_k = min(top_k, len(memory_bank))
+            top_k_indices = torch.topk(similarities_tensor, actual_top_k, dim=-1).indices
+            
+            # Retrieve top-k memories
+            retrieved_memories = []
+            retrieved_info = []
+            
+            for batch_idx in range(batch_size):
+                batch_memories = []
+                batch_info = []
                 
-                # Update usage count
-                memory_bank[memory_idx].usage_count += 1
-                memory_bank[memory_idx].last_accessed = getattr(self, 'timestep', 0)
+                for k_idx in range(actual_top_k):
+                    # Ensure proper indexing
+                    if top_k_indices.dim() == 1:
+                        memory_idx = top_k_indices[k_idx].item()
+                    else:
+                        memory_idx = top_k_indices[batch_idx, k_idx].item()
+                    
+                    batch_memories.append(memory_values[memory_idx][batch_idx])
+                    batch_info.append(memory_info[memory_idx])
+                    
+                    # Update usage count
+                    memory_bank[memory_idx].usage_count += 1
+                    memory_bank[memory_idx].last_accessed = getattr(self, 'timestep', 0)
+                
+                retrieved_memories.append(torch.stack(batch_memories))  # (top_k, memory_dim)
+                retrieved_info.append(batch_info)
             
-            retrieved_memories.append(torch.stack(batch_memories))  # (top_k, memory_dim)
-            retrieved_info.append(batch_info)
-        
-        # Combine retrieved memories
-        retrieved_tensor = torch.stack(retrieved_memories)  # (batch_size, top_k, memory_dim)
-        
-        # Attention over retrieved memories
-        attention_scores = F.softmax(
-            self.attention_layer(retrieved_tensor).squeeze(-1), dim=-1
-        )  # (batch_size, top_k)
-        
-        # Weighted combination
-        memory_output = torch.sum(
-            attention_scores.unsqueeze(-1) * retrieved_tensor, dim=1
-        )  # (batch_size, memory_dim)
-        
-        # Transform output
-        memory_output = self.combine_layer(memory_output)
-        
-        return memory_output, retrieved_info
+            # Combine retrieved memories
+            retrieved_tensor = torch.stack(retrieved_memories)  # (batch_size, top_k, memory_dim)
+            
+            # Attention over retrieved memories
+            attention_scores = F.softmax(
+                self.attention_layer(retrieved_tensor).squeeze(-1), dim=-1
+            )  # (batch_size, top_k)
+            
+            # Weighted combination
+            memory_output = torch.sum(
+                attention_scores.unsqueeze(-1) * retrieved_tensor, dim=1
+            )  # (batch_size, memory_dim)
+            
+            # Transform output
+            memory_output = self.combine_layer(memory_output)
+            
+            return memory_output, retrieved_info
+            
+        except Exception as e:
+            print(f"⚠️  Lỗi trong retrieve function: {e}")
+            print(f"Debug info: batch_size={batch_size}, memory_bank_size={len(memory_bank)}")
+            print(f"Similarities tensor shape: {[s.shape for s in similarities]}")
+            
+            # Fallback: return empty output
+            memory_dim = self.memory_dim if hasattr(self, 'memory_dim') else 128
+            fallback_output = torch.zeros(batch_size, memory_dim, device=query_input.device)
+            return fallback_output, []
 
 
 class MetaLearningEpisodicSystem:
@@ -508,6 +586,10 @@ class MetaLearningEpisodicSystem:
         self.mann = MemoryAugmentedNetwork(
             input_size, hidden_size, memory_size, memory_dim, output_size
         )
+        
+        # Ensure MANN has device property initialized
+        if not hasattr(self.mann, 'device'):
+            self.mann._device = torch.device('cpu')
         
         # Meta-learning components
         self.meta_optimizer = torch.optim.Adam(self.mann.parameters(), lr=1e-4)
@@ -700,29 +782,54 @@ class MetaLearningEpisodicSystem:
                                 query: str, 
                                 context: str = "",
                                 top_k: int = 5) -> List[Dict[str, Any]]:
-        """Select relevant memories cho query"""
-        # Mock query tensor
-        query_tensor = torch.randn(1, self.mann.input_size)
-        
-        # Use MANN to retrieve memories
-        with torch.no_grad():
-            controller_output, _ = self.mann.controller(query_tensor.unsqueeze(1))
-            memory_output, retrieved_info = self.mann.memory_interface.retrieve(
-                controller_output.squeeze(1), self.mann.memory_bank, top_k=top_k
-            )
-        
-        # Format results
-        relevant_memories = []
-        if retrieved_info:
-            for info in retrieved_info[0]:  # First batch
-                relevant_memories.append({
-                    "memory_index": info["index"],
-                    "similarity": info["similarity"],
-                    "importance_weight": info["importance_weight"],
-                    "usage_count": info["usage_count"]
-                })
-        
-        return relevant_memories
+        """Select relevant memories cho query - Tối ưu hóa hiệu suất"""
+        try:
+            # Mock query tensor với pre-allocated memory
+            device = self.mann.device
+            query_tensor = torch.randn(1, self.mann.input_size, device=device)
+            
+            # Use MANN to retrieve memories với error handling
+            with torch.no_grad():
+                controller_output, _ = self.mann.controller(query_tensor.unsqueeze(1))
+                
+                # Ensure controller_output has correct shape
+                if controller_output.dim() == 2:
+                    controller_output = controller_output.unsqueeze(0)  # (1, seq_len, hidden_size)
+                
+                # Squeeze to get single timestep
+                if controller_output.size(1) > 0:
+                    timestep_output = controller_output[:, 0, :]  # (1, hidden_size)
+                else:
+                    # Fallback if no sequence
+                    timestep_output = torch.zeros(1, controller_output.size(-1), device=device)
+                
+                memory_output, retrieved_info = self.mann.memory_interface.retrieve(
+                    timestep_output, self.mann.memory_bank, top_k=top_k
+                )
+            
+            # Optimized result formatting với list comprehension
+            if retrieved_info and len(retrieved_info) > 0:
+                batch_info = retrieved_info[0]  # First batch
+                if batch_info:
+                    return [
+                        {
+                            "memory_index": info.get("index", -1),
+                            "similarity": info.get("similarity", 0.0),
+                            "importance_weight": info.get("importance_weight", 1.0),
+                            "usage_count": info.get("usage_count", 0)
+                        }
+                        for info in batch_info
+                    ]
+            
+            return []
+            
+        except Exception as e:
+            print(f"⚠️  Lỗi khi select relevant memories: {e}")
+            print(f"Debug info: query='{query}', context='{context}', top_k={top_k}")
+            print(f"MANN device: {getattr(self.mann, 'device', 'unknown')}")
+            print(f"MANN input_size: {getattr(self.mann, 'input_size', 'unknown')}")
+            print(f"Memory bank size: {len(getattr(self.mann, 'memory_bank', []))}")
+            return []
     
     def get_system_statistics(self) -> Dict[str, Any]:
         """Thống kê tổng thể của system"""

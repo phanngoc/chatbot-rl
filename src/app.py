@@ -10,23 +10,31 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import time
+import tiktoken
+from dotenv import load_dotenv
+import openai
 
 from agents.rl_chatbot import RLChatbotAgent
+
+# Load environment variables
+load_dotenv()
 
 
 @st.cache_resource
 def load_agent():
     """Load RL Chatbot Agent với caching"""
+    # Load configuration from environment variables
     config = {
-        "model_name": "microsoft/DialoGPT-medium",
-        "device": "cpu",
-        "experience_buffer_size": 5000,
-        "memory_store_type": "chroma",
-        "max_memories": 2000,
-        "consolidation_threshold": 50,
-        "ewc_lambda": 500.0,
-        "temperature": 0.8
+        "model_name": os.getenv("RL_MODEL_NAME", "microsoft/DialoGPT-medium"),
+        "experience_buffer_size": int(os.getenv("RL_EXPERIENCE_BUFFER_SIZE", "5000")),
+        "max_memories": int(os.getenv("RL_MAX_MEMORIES", "2000")),
+        "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0.8"))
     }
+    
+    # Configure OpenAI
+    openai.api_key = os.getenv("OPENAI_API_KEY")
+    if not openai.api_key:
+        st.warning("⚠️ OPENAI_API_KEY không được thiết lập. Vui lòng tạo file .env với API key của bạn.")
     
     agent = RLChatbotAgent(config=config)
     
