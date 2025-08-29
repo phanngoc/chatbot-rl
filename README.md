@@ -26,37 +26,7 @@ pip install -r requirements.txt
 
 # Setup OpenAI API Key
 export OPENAI_API_KEY="your-api-key-here"
-
-# Chạy demo
-./run_demo.sh
 ```
-
-**📖 Chi tiết:** Xem [QUICKSTART.md](QUICKSTART.md) để hướng dẫn setup và sử dụng OpenAI API
-
-## 📁 Cấu trúc dự án
-
-```
-chatbot-rl/
-├── src/
-│   ├── core/                    # Core RL algorithms
-│   │   ├── experience_replay.py # Experience Replay system
-│   │   ├── ewc.py              # Elastic Weight Consolidation
-│   │   ├── meta_learning.py    # Meta-learning & MANN
-│   │   └── temporal_weighting.py # Temporal decay & weighting
-│   ├── memory/                  # Memory systems
-│   │   ├── retrieval_memory.py  # Vector-based memory retrieval
-│   │   └── consolidation.py     # Memory consolidation
-│   ├── agents/                  # Chatbot agents
-│   │   └── rl_chatbot.py       # Main RL chatbot agent
-│   ├── main.py                 # CLI application
-│   └── app.py                  # Streamlit web interface
-├── data/                       # Data storage
-├── configs/                    # Configuration files
-├── examples/                   # Sample data
-└── run_demo.sh                # Demo script
-```
-
-## 🎮 Sử dụng
 
 ### 1. Interactive Chat (Terminal)
 ```bash
@@ -76,11 +46,6 @@ python src/main.py --mode train --data examples/sample_training_data.json
 ### 4. Evaluation
 ```bash
 python src/main.py --mode eval --data examples/sample_training_data.json
-```
-
-### 5. Demo script
-```bash
-./run_demo.sh
 ```
 
 ## 🧠 Kiến trúc hệ thống
@@ -114,100 +79,6 @@ python src/main.py --mode eval --data examples/sample_training_data.json
 - Multiple decay functions (exponential, power-law, forgetting curve)
 - Importance weighting dựa trên feedback và usage
 - Access pattern analysis
-
-## ⚙️ Cấu hình
-
-Chỉnh sửa `configs/default.json`:
-
-```json
-{
-  "model_name": "microsoft/DialoGPT-medium",
-  "device": "cpu",
-  "experience_buffer_size": 10000,
-  "memory_store_type": "chroma",
-  "max_memories": 5000,
-  "consolidation_threshold": 100,
-  "ewc_lambda": 1000.0,
-  "decay_function": "exponential",
-  "temperature": 0.8
-}
-```
-
-## 📊 Web Interface Features
-
-- **💬 Chat Interface**: Trò chuyện real-time với bot
-- **📊 Analytics Dashboard**: Metrics và performance tracking
-- **🔍 Memory Explorer**: Khám phá và search memories
-- **⚙️ Settings**: Cấu hình system parameters
-
-## 🔧 API Usage
-
-```python
-from src.agents.rl_chatbot import RLChatbotAgent
-
-# Initialize agent
-agent = RLChatbotAgent(config={
-    "temperature": 0.8,
-    "ewc_lambda": 1000.0
-})
-
-# Start conversation
-conversation_id = agent.start_conversation()
-
-# Process message
-result = agent.process_message("Xin chào!")
-print(result['response'])
-
-# Provide feedback
-agent.provide_feedback(result['experience_id'], 0.8)
-
-# Save/load state
-agent.save_agent_state("data/my_agent.json")
-agent.load_agent_state("data/my_agent.json")
-```
-
-## 📈 Performance Metrics
-
-System theo dõi các metrics sau:
-- Total interactions
-- Positive/negative feedback ratio
-- Average response time
-- Memory utilization
-- Consolidation frequency
-- Meta-learning episodes
-
-## 🛠️ Development
-
-### Chạy tests
-```bash
-python -m pytest tests/
-```
-
-### Thêm thuật toán mới
-1. Tạo module trong `src/core/`
-2. Implement interface tương thích
-3. Tích hợp vào `RLChatbotAgent`
-4. Update configuration
-
-### Custom Memory Store
-```python
-from src.memory.retrieval_memory import RetrievalAugmentedMemory
-
-# Sử dụng FAISS
-memory = RetrievalAugmentedMemory(store_type="faiss")
-
-# Hoặc ChromaDB
-memory = RetrievalAugmentedMemory(store_type="chroma")
-```
-
-## 🤝 Contributing
-
-1. Fork repository
-2. Tạo feature branch
-3. Commit changes
-4. Push và tạo Pull Request
-
-## 📄 License
 
 MIT License - xem file LICENSE để biết chi tiết.
 

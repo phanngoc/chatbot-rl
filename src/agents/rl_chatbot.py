@@ -130,7 +130,8 @@ class RLChatbotModel:
                          input_text: str,
                          memory_context: torch.Tensor = None,
                          conversation_history: List[Dict[str, str]] = None,
-                         temperature: float = None) -> Dict[str, Any]:
+                         temperature: float = None,
+                         retrieved_info: List[Dict] = None) -> Dict[str, Any]:
         """Generate response sử dụng OpenAI API"""
         
         # Sử dụng temperature từ parameter hoặc default
@@ -143,8 +144,8 @@ class RLChatbotModel:
         system_message = "Bạn là một AI chatbot thông minh và hữu ích. Hãy trả lời một cách tự nhiên và phù hợp."
         
         if memory_context is not None:
-            # Convert memory context thành text description
-            memory_info = self._format_memory_context(memory_context)
+            # Convert memory context thành text description với retrieved_info
+            memory_info = self._format_memory_context(memory_context, retrieved_info)
             if memory_info:
                 system_message += f"\n\nThông tin từ memory: {memory_info}"
         
@@ -201,29 +202,121 @@ class RLChatbotModel:
                 "error": str(e)
             }
     
-    def _format_memory_context(self, memory_context: torch.Tensor) -> str:
-        """Format memory context thành text mô tả"""
+    def _format_memory_context(self, memory_context: torch.Tensor, retrieved_info: List[Dict] = None) -> str:
+        """
+        Format memory context thành text mô tả chi tiết
+        
+        Args:
+            memory_context: Tensor chứa retrieved memories
+            retrieved_info: Thông tin chi tiết về memories được retrieve
+        
+        Returns:
+            Chuỗi mô tả chi tiết về memory context
+        """
         if memory_context is None:
             return ""
         
         try:
             # Validate tensor shape and dimensions
+            num_memories = 0
+            memory_dim = 0
+            
             if memory_context.dim() == 3:
                 batch_size, num_memories, memory_dim = memory_context.shape
-                if memory_dim == self.memory_dim:
-                    return f"Có {num_memories} memories liên quan được tìm thấy từ các cuộc hội thoại trước."
-                else:
-                    self.logger.warning(f"Memory dimension mismatch: expected {self.memory_dim}, got {memory_dim}")
-                    return f"Có memories liên quan được tìm thấy từ các cuộc hội thoại trước."
             elif memory_context.dim() == 2:
                 num_memories, memory_dim = memory_context.shape
-                return f"Có {num_memories} memories liên quan được tìm thấy từ các cuộc hội thoại trước."
             else:
-                return "Có memories liên quan được tìm thấy từ các cuộc hội thoại trước."
+                return "Có thông tin memory liên quan từ các cuộc hội thoại trước."
+            
+            if num_memories == 0:
+                return ""
                 
-        except (IndexError, AttributeError) as e:
+            # Khởi tạo thông tin cơ bản
+            context_parts = [f"📚 Tìm thấy {num_memories} memories liên quan từ {memory_dim}D memory space."]
+            
+            # Nếu có retrieved_info, thêm thông tin chi tiết
+            if retrieved_info and len(retrieved_info) > 0:
+                # Phân tích thông tin memories
+                total_similarity = 0
+                total_importance = 0
+                total_usage = 0
+                high_quality_memories = 0
+                
+                memory_details = []
+                
+                for i, info in enumerate(retrieved_info[:3]):  # Top 3 memories
+                    if isinstance(info, dict):
+                        similarity = info.get('similarity', 0)
+                        importance = info.get('importance_weight', 1.0)
+                        usage = info.get('usage_count', 0)
+                        
+                        total_similarity += similarity
+                        total_importance += importance
+                        total_usage += usage
+                        
+                        # Đánh giá chất lượng memory
+                        if similarity > 0.7 and importance > 1.2:
+                            high_quality_memories += 1
+                        
+                        # Format thông tin memory
+                        quality_indicator = "🔥" if similarity > 0.8 else "⭐" if similarity > 0.6 else "💡"
+                        memory_details.append(
+                            f"  {quality_indicator} Memory #{i+1}: "
+                            f"độ liên quan {similarity:.1%}, "
+                            f"quan trọng {importance:.1f}x, "
+                            f"đã dùng {usage} lần"
+                        )
+                
+                # Tính toán thống kê tổng thể
+                if num_memories > 0:
+                    avg_similarity = total_similarity / min(len(retrieved_info), num_memories)
+                    avg_importance = total_importance / min(len(retrieved_info), num_memories)
+                    avg_usage = total_usage / min(len(retrieved_info), num_memories)
+                    
+                    # Thêm thông tin chất lượng tổng thể
+                    quality_summary = f"📊 Chất lượng memories: độ liên quan trung bình {avg_similarity:.1%}"
+                    
+                    if high_quality_memories > 0:
+                        quality_summary += f", có {high_quality_memories} memories chất lượng cao"
+                    
+                    if avg_importance > 1.3:
+                        quality_summary += f", mức độ quan trọng cao ({avg_importance:.1f}x)"
+                    elif avg_importance < 0.8:
+                        quality_summary += f", mức độ quan trọng thấp ({avg_importance:.1f}x)"
+                    
+                    if avg_usage > 5:
+                        quality_summary += f", được sử dụng thường xuyên ({avg_usage:.0f} lần TB)"
+                    
+                    context_parts.append(quality_summary)
+                
+                # Thêm chi tiết memories
+                if memory_details:
+                    context_parts.extend(memory_details)
+                
+                # Phân tích utilization và fragmentation
+                memory_utilization = min(len(retrieved_info), num_memories) / max(num_memories, 1)
+                if memory_utilization < 0.5:
+                    context_parts.append(f"⚠️  Memory utilization thấp: {memory_utilization:.1%}")
+                
+                # Đánh giá hiệu quả memory
+                if avg_similarity > 0.8 and high_quality_memories >= 2:
+                    context_parts.append("✅ Memory system hoạt động hiệu quả với memories chất lượng cao")
+                elif avg_similarity < 0.4:
+                    context_parts.append("⚠️  Cần cải thiện: memories có độ liên quan thấp")
+                
+            else:
+                # Thông tin cơ bản khi không có retrieved_info
+                estimated_utilization = min(num_memories / 100.0, 1.0)  # Giả sử max 100 memories
+                context_parts.append(f"📈 Estimated memory utilization: {estimated_utilization:.1%}")
+                
+                if memory_dim != self.memory_dim:
+                    context_parts.append(f"⚠️  Memory dimension mismatch: expected {self.memory_dim}D, got {memory_dim}D")
+            
+            return "\n".join(context_parts)
+                
+        except (IndexError, AttributeError, TypeError) as e:
             self.logger.warning(f"Error formatting memory context: {e}")
-            return "Có memories liên quan được tìm thấy từ các cuộc hội thoại trước."
+            return f"Có {getattr(memory_context, 'size', lambda: [0])(0) if hasattr(memory_context, 'size') else 'một số'} memories liên quan từ các cuộc hội thoại trước."
     
     def _validate_tensor_dimensions(self, tensor: torch.Tensor, expected_dims: Tuple[int, ...]) -> bool:
         """Validate tensor dimensions"""
@@ -495,44 +588,133 @@ class RLChatbotAgent:
                                      memories: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Generate response sử dụng retrieved memories"""
         
-        # Prepare memory context tensor
+        # Prepare memory context tensor và retrieved_info
         memory_context = None
+        retrieved_info = []
+        
         if memories and len(memories) > 0:
             try:
                 # Ensure consistent dimensions
                 memory_dim = 256  # Match with model's memory_dim
                 num_memories = min(len(memories), 5)  # Limit to prevent dimension issues
                 
-                # Create properly shaped tensor
-                memory_context = torch.randn(1, num_memories, memory_dim)
+                # Create properly shaped tensor từ memory content
+                memory_context = self._create_memory_tensor(memories[:num_memories], memory_dim)
+                
+                # Prepare retrieved_info từ memories
+                for i, memory in enumerate(memories[:num_memories]):
+                    memory_info = {
+                        "index": i,
+                        "similarity": memory.get("similarity_score", memory.get("similarity", 0.8)),
+                        "importance_weight": memory.get("importance_weight", memory.get("importance", 1.0)),
+                        "usage_count": memory.get("usage_count", memory.get("access_count", 1))
+                    }
+                    retrieved_info.append(memory_info)
                 
                 # Validate tensor shape
                 if memory_context.shape[1] != num_memories or memory_context.shape[2] != memory_dim:
                     self.logger.warning(f"Memory context shape mismatch: {memory_context.shape}")
                     memory_context = None
+                    retrieved_info = []
                     
             except Exception as e:
                 self.logger.warning(f"Failed to create memory context tensor: {e}")
                 memory_context = None
+                retrieved_info = []
         
-        # Generate response using OpenAI API
+        # Generate response using OpenAI API với enhanced memory info
         response_data = self.model.generate_response(
             user_message, 
             memory_context=memory_context,
             conversation_history=self.conversation_history,
-            temperature=self.config.get("temperature", 0.8)
+            temperature=self.config.get("temperature", 0.8),
+            retrieved_info=retrieved_info  # Truyền thêm thông tin chi tiết
         )
         
         # Extract response text và thêm memory info nếu có
         response_text = response_data["response_text"]
         if memories and not response_data.get("error"):
-            memory_info = f" [Sử dụng {len(memories)} memories liên quan]"
+            # Sử dụng thông tin chi tiết từ memory context thay vì chỉ số lượng
+            if retrieved_info:
+                high_quality_count = sum(1 for info in retrieved_info 
+                                       if info.get('similarity', 0) > 0.7 and 
+                                          info.get('importance_weight', 1.0) > 1.2)
+                if high_quality_count > 0:
+                    memory_info = f" [Sử dụng {len(memories)} memories, {high_quality_count} chất lượng cao]"
+                else:
+                    avg_similarity = np.mean([info.get('similarity', 0) for info in retrieved_info])
+                    memory_info = f" [Sử dụng {len(memories)} memories, độ liên quan TB: {avg_similarity:.1%}]"
+            else:
+                memory_info = f" [Sử dụng {len(memories)} memories liên quan]"
             response_text += memory_info
         
         # Update response_data với enhanced text
         response_data["response_text"] = response_text
         
         return response_data
+    
+    def _create_memory_tensor(self, memories: List[Dict[str, Any]], memory_dim: int) -> torch.Tensor:
+        """Tạo memory tensor từ actual memory content thay vì random"""
+        
+        try:
+            num_memories = len(memories)
+            memory_tensor = torch.zeros(1, num_memories, memory_dim)
+            
+            for i, memory in enumerate(memories):
+                # Extract content features từ memory
+                content = memory.get('content', memory.get('text', ''))
+                
+                # Simple feature extraction từ text content
+                if content:
+                    # Character-based features
+                    char_features = []
+                    for c in content.lower()[:memory_dim//4]:
+                        char_features.append(ord(c) / 255.0)  # Normalize to [0,1]
+                    
+                    # Pad or truncate to memory_dim//4
+                    while len(char_features) < memory_dim//4:
+                        char_features.append(0.0)
+                    char_features = char_features[:memory_dim//4]
+                    
+                    # Length and statistical features
+                    length_features = [
+                        len(content) / 1000.0,  # Normalized length
+                        content.count(' ') / max(len(content), 1),  # Word density
+                        content.count('.') / max(len(content), 1),  # Sentence density
+                        len(set(content.lower())) / max(len(content), 1)  # Vocabulary diversity
+                    ]
+                    
+                    # Importance và usage features
+                    meta_features = [
+                        memory.get('similarity_score', memory.get('similarity', 0.5)),
+                        memory.get('importance_weight', memory.get('importance', 1.0)) / 2.0,
+                        min(memory.get('usage_count', memory.get('access_count', 1)) / 10.0, 1.0),
+                        memory.get('confidence_score', 1.0)
+                    ]
+                    
+                    # Combine tất cả features
+                    all_features = char_features + length_features + meta_features
+                    
+                    # Pad đến memory_dim
+                    while len(all_features) < memory_dim:
+                        all_features.append(0.0)
+                    
+                    # Convert to tensor
+                    memory_tensor[0, i, :] = torch.FloatTensor(all_features[:memory_dim])
+                else:
+                    # Fallback: use metadata only
+                    meta_vector = torch.zeros(memory_dim)
+                    meta_vector[0] = memory.get('similarity_score', memory.get('similarity', 0.5))
+                    meta_vector[1] = memory.get('importance_weight', memory.get('importance', 1.0))
+                    meta_vector[2] = memory.get('usage_count', memory.get('access_count', 1))
+                    memory_tensor[0, i, :] = meta_vector
+            
+            return memory_tensor
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to create memory tensor from content: {e}")
+            # Fallback to random tensor
+            return torch.randn(1, len(memories), memory_dim)
     
     def _store_experience(self, 
                          user_message: str,
