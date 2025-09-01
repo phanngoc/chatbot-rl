@@ -21,6 +21,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from core.experience_replay import ExperienceReplayBuffer, Experience, ExperienceReplayTrainer
 from memory.retrieval_memory import RetrievalAugmentedMemory
 from memory.consolidation import MemoryConsolidationSystem
+from memory.memory_manager import IntelligentMemoryManager, LLMExtractor, MemoryOperation
 from core.ewc import MultiTaskEWC
 from core.meta_learning import MetaLearningEpisodicSystem
 from core.temporal_weighting import TemporalWeightingSystem
@@ -435,6 +436,21 @@ class RLChatbotAgent:
             update_interval_hours=self.config.get("weight_update_interval", 6)
         )
         
+        # Intelligent Memory Manager (Algorithm 1)
+        self.llm_extractor = LLMExtractor(
+            model_name=self.config.get("llm_model", "gpt-4o-mini"),
+            api_key=self.config.get("openai_api_key")
+        )
+        
+        self.memory_manager = IntelligentMemoryManager(
+            memory_system=self.retrieval_memory,
+            llm_extractor=self.llm_extractor,
+            similarity_threshold_update=self.config.get("similarity_threshold_update", 0.8),
+            similarity_threshold_delete=self.config.get("similarity_threshold_delete", 0.95),
+            importance_threshold=self.config.get("importance_threshold", 0.3),
+            max_memory_capacity=self.config.get("max_memory_capacity", 5000)
+        )
+        
         # Experience Replay Trainer
         self.replay_trainer = ExperienceReplayTrainer(
             model=self.model,
@@ -721,7 +737,7 @@ class RLChatbotAgent:
                          bot_response: str,
                          context: str = "",
                          user_feedback: Optional[float] = None) -> str:
-        """Store experience trong tất cả memory systems"""
+        """Store experience sử dụng Intelligent Memory Manager (Algorithm 1)"""
         
         experience_id = str(uuid.uuid4())
         timestamp = datetime.now()
@@ -733,7 +749,7 @@ class RLChatbotAgent:
             # Default neutral reward
             reward = 0.0
         
-        # 1. Store trong Experience Replay Buffer
+        # 1. Store trong Experience Replay Buffer (vẫn giữ cho RL training)
         try:
             experience = Experience(
                 state=f"{context} {user_message}".strip(),
@@ -749,24 +765,43 @@ class RLChatbotAgent:
         except Exception as e:
             self.logger.warning(f"Failed to store in experience buffer: {e}")
         
-        # 2. Store trong Retrieval Memory
+        # 2. Intelligent Memory Management cho dialogue turns
         try:
-            if hasattr(self.retrieval_memory, 'add_memory'):
-                memory_id = self.retrieval_memory.add_memory(
-                    content=bot_response,
-                    context=f"{context} {user_message}".strip(),
-                    tags=["conversation", "response"],
-                    importance_score=1.0 + abs(reward),
-                    metadata={
-                        "conversation_id": self.current_conversation_id,
-                        "user_feedback": user_feedback,
-                        "experience_id": experience_id
-                    }
-                )
+            # Prepare dialogue turn for memory manager
+            dialogue_turn = f"User: {user_message}\nBot: {bot_response}"
+            full_context = f"{context}\nConversation ID: {self.current_conversation_id}"
+            
+            # Use Memory Manager để quyết định memory operation
+            memory_result = self.memory_manager.construct_memory_bank(
+                dialogue_turns=[dialogue_turn],
+                context=full_context
+            )
+            
+            self.logger.info(f"Memory Manager result: {memory_result.get('memories_added', 0)} added, "
+                           f"{memory_result.get('memories_updated', 0)} updated, "
+                           f"{memory_result.get('memories_deleted', 0)} deleted, "
+                           f"{memory_result.get('noop_operations', 0)} noop")
+            
         except Exception as e:
-            self.logger.warning(f"Failed to store in retrieval memory: {e}")
+            self.logger.warning(f"Failed to use intelligent memory manager: {e}")
+            # Fallback to simple add_memory
+            try:
+                if hasattr(self.retrieval_memory, 'add_memory'):
+                    memory_id = self.retrieval_memory.add_memory(
+                        content=bot_response,
+                        context=f"{context} {user_message}".strip(),
+                        tags=["conversation", "response"],
+                        importance_score=1.0 + abs(reward),
+                        metadata={
+                            "conversation_id": self.current_conversation_id,
+                            "user_feedback": user_feedback,
+                            "experience_id": experience_id
+                        }
+                    )
+            except Exception as e2:
+                self.logger.warning(f"Fallback memory storage also failed: {e2}")
         
-        # 3. Store trong Meta-learning System
+        # 3. Store trong Meta-learning System (vẫn giữ)
         try:
             if hasattr(self.meta_learning_system, 'store_episodic_experience'):
                 self.meta_learning_system.store_episodic_experience(
@@ -778,7 +813,7 @@ class RLChatbotAgent:
         except Exception as e:
             self.logger.warning(f"Failed to store in meta-learning system: {e}")
         
-        # 4. Store trong Temporal Weighting System
+        # 4. Store trong Temporal Weighting System (vẫn giữ)
         try:
             if hasattr(self.temporal_weighting, 'add_experience'):
                 self.temporal_weighting.add_experience(
@@ -944,12 +979,66 @@ class RLChatbotAgent:
             "conversation_history": self.conversation_history[-10:]  # Recent 10 exchanges
         }
     
+    def process_dialogue_batch(self, 
+                             dialogue_turns: List[str],
+                             context: str = "") -> Dict[str, Any]:
+        """
+        Process một batch dialogue turns sử dụng Memory Manager (Algorithm 1)
+        Useful cho training hoặc processing historical data
+        """
+        
+        if not dialogue_turns:
+            return {"error": "Empty dialogue turns list"}
+        
+        try:
+            # Use Memory Manager to process entire dialogue batch
+            results = self.memory_manager.construct_memory_bank(
+                dialogue_turns=dialogue_turns,
+                context=context
+            )
+            
+            # Add memory manager statistics
+            results["memory_manager_stats"] = self.memory_manager.get_operation_statistics()
+            
+            self.logger.info(f"Processed {len(dialogue_turns)} dialogue turns: "
+                           f"{results.get('memories_added', 0)} added, "
+                           f"{results.get('memories_updated', 0)} updated, "
+                           f"{results.get('memories_deleted', 0)} deleted")
+            
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"Failed to process dialogue batch: {e}")
+            return {"error": str(e), "dialogue_turns_count": len(dialogue_turns)}
+    
+    def get_memory_manager_insights(self) -> Dict[str, Any]:
+        """Lấy insights chi tiết từ Memory Manager"""
+        
+        try:
+            return {
+                "operation_statistics": self.memory_manager.get_operation_statistics(),
+                "configuration": {
+                    "similarity_threshold_update": self.memory_manager.similarity_threshold_update,
+                    "similarity_threshold_delete": self.memory_manager.similarity_threshold_delete,
+                    "importance_threshold": self.memory_manager.importance_threshold,
+                    "max_memory_capacity": self.memory_manager.max_memory_capacity
+                },
+                "memory_bank_status": {
+                    "total_memories": len(self.memory_manager.memory_system.store.memories) if hasattr(self.memory_manager.memory_system, 'store') and hasattr(self.memory_manager.memory_system.store, 'memories') else 0,
+                    "is_near_capacity": self.memory_manager._is_memory_bank_full(),
+                },
+                "llm_extractor_model": self.memory_manager.llm_extractor.model_name
+            }
+        except Exception as e:
+            self.logger.error(f"Failed to get memory manager insights: {e}")
+            return {"error": str(e)}
+    
     def get_system_status(self) -> Dict[str, Any]:
         """Lấy status tổng thể của system"""
         
         return {
             "model_info": {
-                "model_name": "RLChatbot with OpenAI",
+                "model_name": "RLChatbot with OpenAI + Intelligent Memory Manager",
                 "openai_model": self.model.openai_model,
                 "device": self.device,
                 "neural_parameters": (sum(p.numel() for p in self.model.value_estimator.parameters()) if hasattr(self.model, 'value_estimator') else 0) + 
@@ -959,11 +1048,13 @@ class RLChatbotAgent:
             },
             "performance_metrics": self.performance_metrics,
             "memory_systems": self._get_memory_stats(),
+            "memory_manager": self.get_memory_manager_insights(),
             "current_conversation": self.current_conversation_id,
             "system_health": {
                 "experience_buffer_utilization": (len(getattr(self.experience_buffer, 'buffer', [])) / getattr(self.experience_buffer, 'max_size', 1)) * 100 if hasattr(self.experience_buffer, 'buffer') and hasattr(self.experience_buffer, 'max_size') else 0.0,
                 "memory_consolidation_status": "active" if self.consolidation_system else "inactive",
-                "meta_learning_episodes": getattr(self.meta_learning_system, 'meta_learning_stats', {}).get("episodes_trained", 0)
+                "meta_learning_episodes": getattr(self.meta_learning_system, 'meta_learning_stats', {}).get("episodes_trained", 0),
+                "intelligent_memory_manager": "active"
             }
         }
     

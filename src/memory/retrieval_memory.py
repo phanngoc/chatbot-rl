@@ -191,9 +191,12 @@ class ChromaMemoryStore:
                       top_k: int = 5,
                       where_filter: Optional[Dict] = None) -> List[Tuple[EpisodicMemory, float]]:
         """Tìm kiếm memories tương tự"""
+        if not self.memories:  # No memories to search
+            return []
+            
         results = self.collection.query(
             query_texts=[query],
-            n_results=top_k,
+            n_results=min(top_k, len(self.memories)),  # Don't exceed available memories
             where=where_filter
         )
         
@@ -203,8 +206,14 @@ class ChromaMemoryStore:
                 if memory_id in self.memories:
                     memory = self.memories[memory_id]
                     # Convert distance to similarity (ChromaDB returns cosine distance)
-                    similarity = 1 - distance
+                    # Clamp distance to reasonable range và normalize better
+                    distance = max(0.0, min(2.0, distance))  # Cosine distance range [0, 2]
+                    similarity = 1 - (distance / 2.0)  # Normalize to [0, 1]
+                    similarity = max(0.0, min(1.0, similarity))  # Ensure [0, 1] range
                     memories_with_scores.append((memory, similarity))
+        
+        # Sort by similarity descending
+        memories_with_scores.sort(key=lambda x: x[1], reverse=True)
         
         return memories_with_scores
     
