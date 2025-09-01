@@ -189,7 +189,7 @@ class MultiTaskEWC:
     
     def compute_consolidated_penalty(self) -> torch.Tensor:
         """Tính consolidated EWC penalty từ tất cả previous tasks"""
-        total_penalty = 0.0
+        total_penalty = torch.tensor(0.0)
         
         for task_id in self.task_fisher_info:
             if task_id == self.current_task_id:
@@ -200,7 +200,7 @@ class MultiTaskEWC:
             task_importance = self.task_importance[task_id]
             
             # Tính penalty cho task này
-            task_penalty = 0.0
+            task_penalty = torch.tensor(0.0)
             for name, param in self.model.named_parameters():
                 if name in fisher_info and name in optimal_params:
                     fisher = fisher_info[name]
