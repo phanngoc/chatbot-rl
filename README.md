@@ -71,7 +71,7 @@ python src/main.py --mode eval --data examples/sample_training_data.json
 
 ### Meta-learning
 - Memory-Augmented Neural Network (MANN)
-- Neural Turing Machine (NTM) patterns
+- Episodic memory với attention mechanism
 - Học cách select relevant memories
 
 ### Temporal Weighting
