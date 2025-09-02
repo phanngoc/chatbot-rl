@@ -49,7 +49,7 @@ class ConsolidatedKnowledge:
     summary: str
     source_memories: List[str]  # IDs của episodic memories gốc
     confidence_score: float
-    consolidation_method: str  # "summarization", "graph", "distillation"
+    consolidation_method: str  # "summarization", "graph"
     created_at: datetime
     access_count: int = 0
     semantic_embedding: Optional[List[float]] = None
@@ -307,647 +307,25 @@ class KnowledgeGraph:
             return False
 
 
-class ModelDistillation:
-    """
-    Knowledge Distillation cho Episodic Memory System
-    Thực hiện đúng chuẩn Teacher-Student architecture với soft targets và temperature scaling
-    """
-    
-    def __init__(self, 
-                 learning_rate: float = 1e-4,
-                 temperature: float = 4.0,
-                 alpha: float = 0.7,
-                 beta: float = 0.3,
-                 openai_model: str = "gpt-3.5-turbo",
-                 embedding_model: str = "text-embedding-ada-002",
-                 api_key: str = None):
-        
-        # Knowledge Distillation parameters
-        self.temperature = temperature  # Temperature scaling cho soft targets
-        self.alpha = alpha  # Weight cho distillation loss  
-        self.beta = beta    # Weight cho student loss (alpha + beta = 1.0)
-
-        # OpenAI setup
-        self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
-        self.openai_model = openai_model
-        self.embedding_model = embedding_model
-        self.tokenizer_openai = tiktoken.encoding_for_model(openai_model)
-        
-        # Device setup
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.embedding_dim = 1536  # text-embedding-ada-002 dimension
-        
-        # Teacher Model - Complex model với full episodic memory processing
-        self.teacher_model = self._create_teacher_model()
-        
-        # Student Model - Lightweight model cho production
-        self.student_model = self._create_student_model()
-        
-        # Optimizers
-        self.teacher_optimizer = torch.optim.Adam(self.teacher_model.parameters(), lr=learning_rate)
-        self.student_optimizer = torch.optim.Adam(self.student_model.parameters(), lr=learning_rate * 2)
-        
-        # Loss functions
-        self.kl_div_loss = nn.KLDivLoss(reduction='batchmean')
-        self.cross_entropy_loss = nn.CrossEntropyLoss()
-        
-        # Caching
-        self.embedding_cache: Dict[str, np.ndarray] = {}
-        self.teacher_trained = False
-    
-    def _create_teacher_model(self) -> nn.Module:
-        """Tạo Teacher Model - Mô hình phức tạp với full processing capability"""
-        return nn.Sequential(
-            # Complex feature extraction
-            nn.Linear(self.embedding_dim, 1024),
-            nn.ReLU(),
-            nn.BatchNorm1d(1024),
-            nn.Dropout(0.2),
-            
-            nn.Linear(1024, 512),
-            nn.ReLU(), 
-            nn.BatchNorm1d(512),
-            nn.Dropout(0.2),
-            
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.BatchNorm1d(256),
-            nn.Dropout(0.1),
-            
-            # Memory consolidation layers
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),  # Distilled knowledge representation
-            nn.Softmax(dim=1)   # Soft probability distribution
-        ).to(self.device)
-        
-    def _create_student_model(self) -> nn.Module:
-        """Tạo Student Model - Mô hình lightweight cho production"""
-        return nn.Sequential(
-            # Simplified architecture
-            nn.Linear(self.embedding_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            
-            nn.Linear(128, 64),   # Same output dim as teacher
-            nn.Softmax(dim=1)     # Soft probability distribution
-        ).to(self.device)
-    
-    def distill_from_memories(self, 
-                            memories: List[Dict[str, Any]], 
-                            num_epochs: int = 5,
-                            batch_size: int = 8) -> Dict[str, Any]:
-        """
-        Knowledge Distillation chính thức từ episodic memories
-        Bao gồm:
-        1. Train Teacher model trên memories 
-        2. Distill knowledge sang Student model
-        3. Sử dụng soft targets với temperature scaling
-        """
-        print(f"🎓 Bắt đầu Knowledge Distillation với {len(memories)} memories...")
-        
-        # Phase 1: Train Teacher Model
-        teacher_results = self._train_teacher_model(memories, num_epochs, batch_size)
-        
-        if not teacher_results["success"]:
-            return {
-                "status": "failed",
-                "reason": "teacher_training_failed",
-                "teacher_results": teacher_results
-            }
-        
-        # Phase 2: Distill to Student Model  
-        distillation_results = self._distill_to_student(memories, num_epochs, batch_size)
-        
-        return {
-            "status": "completed",
-            "method": "knowledge_distillation",
-            "teacher_training": teacher_results,
-            "distillation": distillation_results,
-            "parameters": {
-                "temperature": self.temperature,
-                "alpha": self.alpha,
-                "beta": self.beta
-            }
-        }
-    
-    def _train_teacher_model(self, 
-                           memories: List[Dict[str, Any]], 
-                           num_epochs: int = 5,
-                           batch_size: int = 8) -> Dict[str, Any]:
-        """Train Teacher Model trên episodic memories"""
-        print("👨‍🏫 Training Teacher Model...")
-        
-        # Prepare training data
-        training_data = self._prepare_training_data(memories)
-        if not training_data:
-            return {"success": False, "reason": "no_valid_data"}
-        
-        self.teacher_model.train()
-        total_loss = 0.0
-        total_batches = 0
-        
-        for epoch in range(num_epochs):
-            epoch_loss = 0.0
-            epoch_batches = 0
-            
-            for i in range(0, len(training_data), batch_size):
-                batch = training_data[i:i + batch_size]
-                
-                # Get embeddings và rewards
-                embeddings, rewards = self._prepare_teacher_batch(batch)
-                if embeddings is None:
-                    continue
-                
-                # Forward pass
-                self.teacher_optimizer.zero_grad()
-                
-                embeddings_tensor = torch.FloatTensor(embeddings).to(self.device)
-                rewards_tensor = torch.FloatTensor(rewards).to(self.device)
-                
-                # Teacher prediction  
-                teacher_output = self.teacher_model(embeddings_tensor)
-                
-                # Self-supervised loss (predict reward distribution)
-                reward_targets = self._create_reward_targets(rewards_tensor)
-                loss = self.cross_entropy_loss(teacher_output, reward_targets)
-                
-                # Backward pass
-                loss.backward()
-                self.teacher_optimizer.step()
-                
-                epoch_loss += loss.item()
-                total_loss += loss.item()
-                epoch_batches += 1
-                total_batches += 1
-            
-            avg_epoch_loss = epoch_loss / max(epoch_batches, 1)
-            print(f"Teacher Epoch {epoch + 1}/{num_epochs}, Loss: {avg_epoch_loss:.4f}")
-        
-        self.teacher_trained = True
-        return {
-            "success": True,
-            "avg_loss": total_loss / max(total_batches, 1),
-            "epochs": num_epochs,
-            "batches": total_batches
-        }
-    
-    def _distill_to_student(self, 
-                          memories: List[Dict[str, Any]], 
-                          num_epochs: int = 5,
-                          batch_size: int = 8) -> Dict[str, Any]:
-        """Distill knowledge từ Teacher sang Student với soft targets"""
-        print("🎒 Distilling knowledge to Student Model...")
-        
-        if not self.teacher_trained:
-            return {"success": False, "reason": "teacher_not_trained"}
-        
-        training_data = self._prepare_training_data(memories)
-        if not training_data:
-            return {"success": False, "reason": "no_valid_data"}
-        
-        self.teacher_model.eval()  # Teacher ở mode evaluation
-        self.student_model.train()  # Student ở mode training
-        
-        total_distillation_loss = 0.0
-        total_student_loss = 0.0
-        total_batches = 0
-        
-        for epoch in range(num_epochs):
-            epoch_distillation_loss = 0.0
-            epoch_student_loss = 0.0
-            epoch_batches = 0
-            
-            for i in range(0, len(training_data), batch_size):
-                batch = training_data[i:i + batch_size]
-                
-                embeddings, rewards = self._prepare_teacher_batch(batch)
-                if embeddings is None:
-                    continue
-                
-                self.student_optimizer.zero_grad()
-                
-                embeddings_tensor = torch.FloatTensor(embeddings).to(self.device)
-                rewards_tensor = torch.FloatTensor(rewards).to(self.device)
-                
-                # Teacher soft targets với temperature scaling
-                with torch.no_grad():
-                    teacher_logits = self.teacher_model(embeddings_tensor)
-                    teacher_soft = F.softmax(teacher_logits / self.temperature, dim=1)
-                
-                # Student predictions
-                student_logits = self.student_model(embeddings_tensor)
-                student_soft = F.log_softmax(student_logits / self.temperature, dim=1)
-                
-                # Distillation Loss (KL Divergence)
-                distillation_loss = self.kl_div_loss(student_soft, teacher_soft) * (self.temperature ** 2)
-                
-                # Student Loss (original task)
-                reward_targets = self._create_reward_targets(rewards_tensor)
-                student_loss = self.cross_entropy_loss(student_logits, reward_targets)
-                
-                # Combined Loss
-                total_loss = self.alpha * distillation_loss + self.beta * student_loss
-                
-                # Backward pass
-                total_loss.backward()
-                self.student_optimizer.step()
-                
-                epoch_distillation_loss += distillation_loss.item()
-                epoch_student_loss += student_loss.item()
-                total_distillation_loss += distillation_loss.item()
-                total_student_loss += student_loss.item()
-                epoch_batches += 1
-                total_batches += 1
-            
-            avg_distill_loss = epoch_distillation_loss / max(epoch_batches, 1)
-            avg_student_loss = epoch_student_loss / max(epoch_batches, 1)
-            print(f"Student Epoch {epoch + 1}/{num_epochs}, Distill Loss: {avg_distill_loss:.4f}, Student Loss: {avg_student_loss:.4f}")
-        
-        return {
-            "success": True,
-            "avg_distillation_loss": total_distillation_loss / max(total_batches, 1),
-            "avg_student_loss": total_student_loss / max(total_batches, 1),
-            "epochs": num_epochs,
-            "batches": total_batches
-        }
-    
-    def _create_reward_targets(self, rewards: torch.Tensor) -> torch.Tensor:
-        """Tạo categorical targets từ reward values"""
-        # Normalize rewards to [0, 1] và convert to categories
-        normalized_rewards = (rewards - rewards.min()) / (rewards.max() - rewards.min() + 1e-8)
-        # Convert to 64 categories (matching output dim)
-        categories = (normalized_rewards * 63).long().clamp(0, 63)
-        return categories
-    
-    def _prepare_training_data(self, memories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Chuẩn bị training data từ memories"""
-        training_data = []
-        
-        for memory in memories:
-            context = memory.get('context', '')
-            content = memory.get('content', '')
-            reward = memory.get('reward', 0.0)
-            
-            # Filter memories với content đầy đủ và reward hợp lệ
-            if context and content and -1.0 <= reward <= 1.0:
-                training_data.append({
-                    'context': context,
-                    'content': content,
-                    'reward': reward,
-                    'memory_id': memory.get('id', 'unknown')
-                })
-        
-        print(f"📊 Prepared {len(training_data)} training samples từ {len(memories)} total memories")
-        return training_data
-    
-    def _prepare_teacher_batch(self, 
-                             batch: List[Dict[str, Any]]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Chuẩn bị batch cho teacher training"""
-        embeddings = []
-        rewards = []
-        
-        for item in batch:
-            # Combine context và content cho comprehensive embedding
-            combined_text = f"Context: {item['context']}\nContent: {item['content']}"
-            embedding = self.get_openai_embedding(combined_text)
-            
-            if embedding.size > 0:
-                embeddings.append(embedding)
-                rewards.append(item['reward'])
-        
-        if not embeddings:
-            return None, None
-        
-        return np.array(embeddings), np.array(rewards)
-    
-    def get_student_prediction(self, text: str) -> Dict[str, Any]:
-        """Sử dụng Student Model đã được distill để predict"""
-        if not self.teacher_trained:
-            return {"error": "Model chưa được train"}
-        
-        # Get embedding cho text
-        embedding = self.get_openai_embedding(text)
-        if embedding.size == 0:
-            return {"error": "Could not get embedding"}
-        
-        # Predict với Student Model
-        self.student_model.eval()
-        with torch.no_grad():
-            embedding_tensor = torch.FloatTensor(embedding).unsqueeze(0).to(self.device)
-            student_output = self.student_model(embedding_tensor)
-            
-            # Get confidence score từ distribution
-            confidence = torch.max(student_output).item()
-            prediction_class = torch.argmax(student_output).item()
-            
-        return {
-            "prediction_class": prediction_class,
-            "confidence": confidence,
-            "distribution": student_output.cpu().numpy().tolist(),
-            "model_type": "student",
-            "compressed_size": f"{sum(p.numel() for p in self.student_model.parameters())} parameters"
-        }
-    
-    def compare_teacher_student(self, text: str) -> Dict[str, Any]:
-        """So sánh predictions giữa Teacher và Student models"""
-        if not self.teacher_trained:
-            return {"error": "Models chưa được train"}
-        
-        embedding = self.get_openai_embedding(text)
-        if embedding.size == 0:
-            return {"error": "Could not get embedding"}
-        
-        self.teacher_model.eval()
-        self.student_model.eval()
-        
-        with torch.no_grad():
-            embedding_tensor = torch.FloatTensor(embedding).unsqueeze(0).to(self.device)
-            
-            # Teacher prediction
-            teacher_output = self.teacher_model(embedding_tensor)
-            teacher_confidence = torch.max(teacher_output).item()
-            teacher_class = torch.argmax(teacher_output).item()
-            
-            # Student prediction  
-            student_output = self.student_model(embedding_tensor)
-            student_confidence = torch.max(student_output).item()
-            student_class = torch.argmax(student_output).item()
-            
-            # KL Divergence between predictions
-            kl_div = F.kl_div(
-                F.log_softmax(student_output, dim=1),
-                F.softmax(teacher_output, dim=1),
-                reduction='batchmean'
-            ).item()
-        
-        return {
-            "teacher": {
-                "prediction_class": teacher_class,
-                "confidence": teacher_confidence,
-                "model_size": f"{sum(p.numel() for p in self.teacher_model.parameters())} parameters"
-            },
-            "student": {
-                "prediction_class": student_class,
-                "confidence": student_confidence,
-                "model_size": f"{sum(p.numel() for p in self.student_model.parameters())} parameters"
-            },
-            "similarity": {
-                "prediction_match": teacher_class == student_class,
-                "kl_divergence": kl_div,
-                "confidence_diff": abs(teacher_confidence - student_confidence)
-            },
-            "compression_ratio": sum(p.numel() for p in self.teacher_model.parameters()) / sum(p.numel() for p in self.student_model.parameters())
-        }
-    
-    def save_models(self, filepath_prefix: str) -> Dict[str, str]:
-        """Lưu cả Teacher và Student models"""
-        teacher_path = f"{filepath_prefix}_teacher.pth"
-        student_path = f"{filepath_prefix}_student.pth"
-        
-        torch.save({
-            'model_state_dict': self.teacher_model.state_dict(),
-            'optimizer_state_dict': self.teacher_optimizer.state_dict(),
-            'embedding_dim': self.embedding_dim,
-            'trained': self.teacher_trained
-        }, teacher_path)
-        
-        torch.save({
-            'model_state_dict': self.student_model.state_dict(),
-            'optimizer_state_dict': self.student_optimizer.state_dict(),
-            'embedding_dim': self.embedding_dim,
-            'temperature': self.temperature,
-            'alpha': self.alpha,
-            'beta': self.beta
-        }, student_path)
-        
-        return {
-            "teacher_model": teacher_path,
-            "student_model": student_path
-        }
-    
-    def load_models(self, filepath_prefix: str) -> bool:
-        """Load cả Teacher và Student models"""
-        teacher_path = f"{filepath_prefix}_teacher.pth"
-        student_path = f"{filepath_prefix}_student.pth"
-        
-        try:
-            # Load Teacher
-            teacher_checkpoint = torch.load(teacher_path, map_location=self.device)
-            self.teacher_model.load_state_dict(teacher_checkpoint['model_state_dict'])
-            self.teacher_optimizer.load_state_dict(teacher_checkpoint['optimizer_state_dict'])
-            self.teacher_trained = teacher_checkpoint.get('trained', False)
-            
-            # Load Student
-            student_checkpoint = torch.load(student_path, map_location=self.device)
-            self.student_model.load_state_dict(student_checkpoint['model_state_dict'])
-            self.student_optimizer.load_state_dict(student_checkpoint['optimizer_state_dict'])
-            
-            return True
-        except Exception as e:
-            print(f"Lỗi khi load models: {e}")
-            return False
-    
-    def _distill_with_openai(self, 
-                           memories: List[Dict[str, Any]], 
-                           num_epochs: int = 3,
-                           batch_size: int = 4) -> Dict[str, Any]:
-        """DEPRECATED: Distill knowledge sử dụng OpenAI embeddings - Use distill_from_memories instead"""
-        print(f"🔄 Bắt đầu OpenAI distillation với {len(memories)} memories...")
-        
-        # Prepare data với OpenAI embeddings
-        distillation_data = self._prepare_openai_distillation_data(memories)
-        
-        if not distillation_data:
-            return {
-                "status": "failed",
-                "reason": "no_valid_data",
-                "memories_processed": 0,
-                "method": "openai"
-            }
-        
-        total_loss = 0.0
-        total_batches = 0
-        token_stats = {"total_tokens": 0, "avg_efficiency": 0.0}
-        
-        self.distillation_network.train()
-        
-        for epoch in range(num_epochs):
-            epoch_loss = 0.0
-            epoch_batches = 0
-            
-            # Process in batches
-            for i in range(0, len(distillation_data), batch_size):
-                batch = distillation_data[i:i + batch_size]
-                
-                # Prepare batch embeddings
-                batch_embeddings, batch_targets = self._prepare_embedding_batch(batch)
-                
-                if batch_embeddings is None:
-                    continue
-                
-                # Forward pass
-                self.optimizer.zero_grad()
-                
-                # Convert embeddings to torch tensors
-                embeddings_tensor = torch.FloatTensor(batch_embeddings).to(self.device)
-                targets_tensor = torch.FloatTensor(batch_targets).to(self.device)
-                
-                # Distillation network forward
-                distilled_features = self.distillation_network(embeddings_tensor)
-                
-                # Reconstruction loss
-                loss = nn.MSELoss()(distilled_features, targets_tensor[:, :128])  # Match output dim
-                
-                # Backward pass
-                loss.backward()
-                self.optimizer.step()
-                
-                epoch_loss += loss.item()
-                total_loss += loss.item()
-                epoch_batches += 1
-                total_batches += 1
-            
-            avg_epoch_loss = epoch_loss / max(epoch_batches, 1)
-            print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {avg_epoch_loss:.4f}")
-        
-        # Calculate final metrics
-        avg_loss = total_loss / max(total_batches, 1)
-        
-        # Token efficiency analysis
-        for data in distillation_data:
-            efficiency = self._calculate_token_efficiency(data["context"])
-            token_stats["total_tokens"] += efficiency["token_count"]
-            token_stats["avg_efficiency"] += efficiency["efficiency_score"]
-        
-        token_stats["avg_efficiency"] /= max(len(distillation_data), 1)
-        
-        return {
-            "status": "completed",
-            "method": "openai",
-            "avg_loss": avg_loss,
-            "total_batches": total_batches,
-            "epochs": num_epochs,
-            "memories_processed": len(distillation_data),
-            "token_statistics": token_stats,
-            "embedding_cache_size": len(self.embedding_cache)
-        }
+# ModelDistillation class removed - không được sử dụng hiệu quả trong hệ thống
+# Thay thế bằng OpenAI API và các phương pháp consolidation đơn giản hơn
     
 
     
-    def get_openai_embedding(self, text: str) -> np.ndarray:
-        """Lấy embedding từ OpenAI API với caching"""
-        # Check cache trước
-        if text in self.embedding_cache:
-            return self.embedding_cache[text]
-        
-        try:
-            # Call OpenAI embedding API
-            response = self.client.embeddings.create(
-                model=self.embedding_model,
-                input=text
-            )
-            
-            embedding = np.array(response.data[0].embedding)
-            
-            # Cache kết quả
-            self.embedding_cache[text] = embedding
-            
-            return embedding
-            
-        except Exception as e:
-            print(f"Lỗi khi lấy embedding: {e}")
-            # Fallback: random embedding
-            return np.random.normal(0, 0.1, self.embedding_dim)
+
     
-    def _calculate_token_efficiency(self, text: str) -> Dict[str, Any]:
-        """Tính toán hiệu quả sử dụng token với OpenAI tokenizer"""
-        try:
-            tokens = self.tokenizer_openai.encode(text)
-            return {
-                "token_count": len(tokens),
-                "character_count": len(text),
-                "tokens_per_char": len(tokens) / max(len(text), 1),
-                "efficiency_score": len(text) / max(len(tokens), 1)  # chars per token
-            }
-        except Exception as e:
-            print(f"Lỗi khi tokenize: {e}")
-            return {"token_count": 0, "efficiency_score": 0}
+
     
-    def _prepare_openai_distillation_data(self, 
-                                        memories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Chuẩn bị data cho distillation với OpenAI embeddings"""
-        distillation_data = []
-        
-        for memory in memories:
-            context = memory.get('context', '')
-            content = memory.get('content', '')
-            reward = memory.get('reward', 0.0)
-            
-            # Chỉ sử dụng memories với reward tốt
-            if context and content and reward > 0.3:
-                distillation_data.append({
-                    'context': context,
-                    'content': content,
-                    'reward': reward,
-                    'memory_id': memory.get('id', 'unknown')
-                })
-        
-        print(f"📊 Filtered {len(distillation_data)} good memories từ {len(memories)} total")
-        return distillation_data
+
+
     
-    def _prepare_embedding_batch(self, 
-                               batch: List[Dict[str, Any]]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Chuẩn bị batch embeddings cho OpenAI distillation"""
-        context_embeddings = []
-        content_embeddings = []
-        
-        for item in batch:
-            # Get embeddings cho context và content
-            context_emb = self.get_openai_embedding(item['context'])
-            content_emb = self.get_openai_embedding(item['content'])
-            
-            if context_emb.size > 0 and content_emb.size > 0:
-                context_embeddings.append(context_emb)
-                content_embeddings.append(content_emb)
-        
-        if not context_embeddings:
-            return None, None
-        
-        return np.array(context_embeddings), np.array(content_embeddings)
+
     
-    def extract_distilled_knowledge(self, text: str) -> Dict[str, Any]:
-        """Extract distilled knowledge representation từ text"""
-        return self._extract_with_openai(text)
+
     
-    def _extract_with_openai(self, text: str) -> Dict[str, Any]:
-        """Extract knowledge sử dụng OpenAI embeddings"""
-        # Get OpenAI embedding
-        embedding = self.get_openai_embedding(text)
-        
-        if embedding.size == 0:
-            return {"error": "Could not get embedding"}
-        
-        # Process qua distillation network
-        with torch.no_grad():
-            embedding_tensor = torch.FloatTensor(embedding).unsqueeze(0).to(self.device)
-            distilled_features = self.distillation_network(embedding_tensor)
-            
-        # Token analysis
-        token_info = self._calculate_token_efficiency(text)
-        
-        return {
-            "distilled_features": distilled_features.cpu().numpy().tolist(),
-            "original_embedding_dim": len(embedding),
-            "distilled_dim": distilled_features.shape[1],
-            "compression_ratio": len(embedding) / distilled_features.shape[1],
-            "token_analysis": token_info,
-            "method": "openai"
-        }
+
+    
+
     
 
 
@@ -969,10 +347,7 @@ class MemoryConsolidationSystem:
         # Initialize components
         self.summarizer = LLMSummarizer(openai_model=openai_model, api_key=api_key)
         self.knowledge_graph = KnowledgeGraph()
-        self.distillation = ModelDistillation(
-            openai_model=openai_model,
-            api_key=api_key
-        )
+        # ModelDistillation removed - không hiệu quả
         
         # Storage for consolidated knowledge
         self.consolidated_knowledge: Dict[str, ConsolidatedKnowledge] = {}
@@ -1000,7 +375,6 @@ class MemoryConsolidationSystem:
         results = {
             "summarization": None,
             "graph_integration": None,
-            "distillation": None,
             "total_memories_processed": len(episodic_memories)
         }
         
@@ -1010,8 +384,7 @@ class MemoryConsolidationSystem:
         if method in ["graph", "all"]:
             results["graph_integration"] = self._consolidate_via_graph(episodic_memories)
         
-        if method in ["distillation", "all"]:
-            results["distillation"] = self._consolidate_via_distillation(episodic_memories)
+        # Distillation method removed - không hiệu quả
         
         self.last_consolidation = datetime.now()
         
@@ -1167,28 +540,7 @@ Tóm tắt:"""
             "graph_edges": self.knowledge_graph.graph.number_of_edges()
         }
     
-    def _consolidate_via_distillation(self, memories: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Consolidation qua model distillation"""
-        # Filter memories with good rewards for distillation
-        good_memories = [m for m in memories if m.get('reward', 0) > 0.5]
-        
-        if len(good_memories) < 10:  # Need minimum memories for distillation
-            return {
-                "method": "distillation",
-                "status": "skipped",
-                "reason": "insufficient_good_memories",
-                "available_memories": len(good_memories)
-            }
-        
-        # Run distillation
-        distillation_results = self.distillation.distill_from_memories(good_memories)
-        
-        return {
-            "method": "distillation",
-            "status": "completed",
-            "memories_used": len(good_memories),
-            **distillation_results
-        }
+    # _consolidate_via_distillation method removed - không hiệu quả
     
     @profile_function
     def _group_memories_by_similarity(self, 
@@ -1321,20 +673,13 @@ Tóm tắt:"""
             }
         }
         
-        info["openai_integration"].update({
-            "embedding_model": getattr(self.distillation, 'embedding_model', 'unknown'),
-            "embedding_cache_size": len(getattr(self.distillation, 'embedding_cache', {})),
-            "distillation_method": "openai_embeddings"
-        })
+        # Distillation integration removed
         
         return info
     
     def clear_embedding_cache(self) -> int:
-        """Xóa embedding cache để tiết kiệm memory"""
-        if hasattr(self.distillation, 'embedding_cache'):
-            cache_size = len(self.distillation.embedding_cache)
-            self.distillation.embedding_cache.clear()
-            return cache_size
+        """Xóa embedding cache để tiết kiệm memory - distillation removed"""
+        # ModelDistillation đã bị xóa, không còn cache để clear
         return 0
     
     def force_save_knowledge(self, filepath: str = None) -> Dict[str, Any]:

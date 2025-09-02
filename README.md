@@ -61,9 +61,8 @@ python src/main.py --mode eval --data examples/sample_training_data.json
 - Forgetting mechanism với temporal decay
 
 ### Memory Consolidation
-- **Summarization**: LLM tóm tắt nhiều experiences
-- **Graph Integration**: Knowledge graph với concepts
-- **Distillation**: Fine-tune model weights từ episodic memories
+- **Summarization**: LLM tóm tắt nhiều experiences với OpenAI API
+- **Graph Integration**: Knowledge graph với concepts và relationships
 
 ### Elastic Weight Consolidation
 - Fisher Information Matrix để xác định importance của weights

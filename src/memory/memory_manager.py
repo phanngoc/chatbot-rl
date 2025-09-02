@@ -123,14 +123,14 @@ Chỉ trả về JSON, không có text khác.
                 
             except json.JSONDecodeError as e:
                 self.logger.warning(f"Failed to parse LLM JSON response: {e}")
-                return self._fallback_extraction(dialogue_turn)
+                return self._create_simple_fallback(dialogue_turn)
                 
         except Exception as e:
             self.logger.error(f"LLM extraction failed: {e}")
-            return self._fallback_extraction(dialogue_turn)
+            return self._create_simple_fallback(dialogue_turn)
     
-    def _fallback_extraction(self, dialogue_turn: str) -> Dict[str, Any]:
-        """Fallback extraction khi LLM fails"""
+    def _create_simple_fallback(self, dialogue_turn: str) -> Dict[str, Any]:
+        """Simple fallback extraction khi LLM fails"""
         
         # Simple rule-based extraction
         words = dialogue_turn.lower().split()
@@ -498,21 +498,47 @@ class IntelligentMemoryManager:
         
         try:
             if decision.operation == MemoryOperation.ADD:
-                # Add new memory
-                memory_id = self.memory_system.add_memory(
-                    content=dialogue_turn,
-                    context=context,
-                    tags=extracted_info.get("topics", []) + [f"sentiment_{extracted_info.get('sentiment', 'neutral')}"],
-                    importance_score=extracted_info.get("importance", 0.5),
-                    metadata={
-                        "entities": extracted_info.get("entities", []),
-                        "intent": extracted_info.get("intent", ""),
-                        "key_facts": extracted_info.get("key_facts", []),
-                        "memory_type": extracted_info.get("memory_type", "other"),
-                        "operation": "ADD",
-                        "timestamp": datetime.now().isoformat()
-                    }
-                )
+                # Add new memory với error handling cho dimension mismatch
+                try:
+                    memory_id = self.memory_system.add_memory(
+                        content=dialogue_turn,
+                        context=context,
+                        tags=extracted_info.get("topics", []) + [f"sentiment_{extracted_info.get('sentiment', 'neutral')}"],
+                        importance_score=extracted_info.get("importance", 0.5),
+                        metadata={
+                            "entities": extracted_info.get("entities", []),
+                            "intent": extracted_info.get("intent", ""),
+                            "key_facts": extracted_info.get("key_facts", []),
+                            "memory_type": extracted_info.get("memory_type", "other"),
+                            "operation": "ADD",
+                            "timestamp": datetime.now().isoformat()
+                        }
+                    )
+                except Exception as e:
+                    if "expecting embedding with dimension" in str(e):
+                        self.logger.warning(f"Embedding dimension mismatch detected: {e}")
+                        # Try again after ChromaDB auto-fixes the collection
+                        try:
+                            memory_id = self.memory_system.add_memory(
+                                content=dialogue_turn,
+                                context=context,
+                                tags=extracted_info.get("topics", []) + [f"sentiment_{extracted_info.get('sentiment', 'neutral')}"],
+                                importance_score=extracted_info.get("importance", 0.5),
+                                metadata={
+                                    "entities": extracted_info.get("entities", []),
+                                    "intent": extracted_info.get("intent", ""),
+                                    "key_facts": extracted_info.get("key_facts", []),
+                                    "memory_type": extracted_info.get("memory_type", "other"),
+                                    "operation": "ADD",
+                                    "timestamp": datetime.now().isoformat()
+                                }
+                            )
+                        except Exception as retry_error:
+                            self.logger.error(f"Failed to add memory after dimension fix: {retry_error}")
+                            raise retry_error
+                    else:
+                        self.logger.error(f"Error adding memory: {e}")
+                        raise e
                 
                 result = {
                     "success": True,

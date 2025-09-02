@@ -9,7 +9,7 @@ import numpy as np
 import faiss
 import chromadb
 from typing import List, Dict, Any, Optional, Tuple
-from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 import uuid
@@ -63,12 +63,14 @@ class VectorMemoryStore:
     """Vector store sử dụng FAISS để lưu trữ và search memories"""
     
     def __init__(self, 
-                 embedding_model: str = "all-MiniLM-L6-v2",
-                 dimension: int = 384,
+                 embedding_model: str = "text-embedding-ada-002",
+                 dimension: int = 1536,
                  index_type: str = "flat"):
-        self.embedding_model = SentenceTransformer(embedding_model)
+        self.openai_client = OpenAI()
+        self.embedding_model = embedding_model
         self.dimension = dimension
         self.index_type = index_type
+        self.embedding_cache: Dict[str, np.ndarray] = {}
         
         # Initialize FAISS index
         if index_type == "flat":
@@ -88,7 +90,7 @@ class VectorMemoryStore:
         # Generate embedding if not exists
         if memory.embedding is None:
             text_to_embed = f"{memory.content} {memory.context}"
-            embedding = self.embedding_model.encode([text_to_embed])[0]
+            embedding = self._get_openai_embedding(text_to_embed)
             memory.embedding = embedding.tolist()
         
         # Add to FAISS index
@@ -110,7 +112,7 @@ class VectorMemoryStore:
             return []
         
         # Generate query embedding
-        query_embedding = self.embedding_model.encode([query])[0]
+        query_embedding = self._get_openai_embedding(query)
         query_array = np.array([query_embedding], dtype=np.float32)
         
         # Search in FAISS
@@ -154,6 +156,31 @@ class VectorMemoryStore:
             del self.id_to_index[memory_id]
         
         return True
+    
+    def _get_openai_embedding(self, text: str) -> np.ndarray:
+        """Lấy embedding từ OpenAI API với caching"""
+        # Check cache first
+        if text in self.embedding_cache:
+            return self.embedding_cache[text]
+        
+        try:
+            # Call OpenAI embedding API
+            response = self.openai_client.embeddings.create(
+                model=self.embedding_model,
+                input=text
+            )
+            
+            embedding = np.array(response.data[0].embedding)
+            
+            # Cache the embedding
+            self.embedding_cache[text] = embedding
+            
+            return embedding
+            
+        except Exception as e:
+            print(f"Lỗi khi lấy embedding: {e}")
+            # Fallback: random embedding
+            return np.random.normal(0, 0.1, self.dimension)
 
 
 class ChromaMemoryStore:
@@ -161,30 +188,120 @@ class ChromaMemoryStore:
     
     def __init__(self, 
                  collection_name: str = "episodic_memories",
-                 persist_directory: str = "data/chroma_db"):
+                 persist_directory: str = "data/chroma_db",
+                 use_openai_embedding: bool = True,
+                 embedding_model: str = "text-embedding-ada-002"):
         self.client = chromadb.PersistentClient(path=persist_directory)
-        self.collection = self.client.get_or_create_collection(
-            name=collection_name,
-            metadata={"description": "Episodic memories for chatbot"}
-        )
+        self.use_openai_embedding = use_openai_embedding
+        self.embedding_model = embedding_model
+        self.collection_name = collection_name
+        
+        if self.use_openai_embedding:
+            self.openai_client = OpenAI()
+            self.embedding_cache: Dict[str, List[float]] = {}
+            
+            # Kiểm tra xem collection đã tồn tại chưa và có dimension conflict không
+            try:
+                existing_collection = self.client.get_collection(name=collection_name)
+                # Test với một sample embedding để kiểm tra dimension
+                test_embedding = self._get_openai_embedding("test")
+                if test_embedding:
+                    try:
+                        # Try adding a test document để kiểm tra dimension compatibility
+                        existing_collection.add(
+                            documents=["dimension_test"],
+                            embeddings=[test_embedding],
+                            ids=["test_dimension_check"]
+                        )
+                        # Nếu thành công, xóa test document
+                        existing_collection.delete(ids=["test_dimension_check"])
+                        self.collection = existing_collection
+                    except Exception as dimension_error:
+                        if "expecting embedding with dimension" in str(dimension_error):
+                            # Dimension mismatch detected - delete và recreate collection
+                            print(f"ChromaDB dimension mismatch detected. Recreating collection: {dimension_error}")
+                            self.client.delete_collection(name=collection_name)
+                            self.collection = self.client.create_collection(
+                                name=collection_name,
+                                metadata={"description": "Episodic memories for chatbot - OpenAI embeddings", "embedding_model": embedding_model}
+                            )
+                        else:
+                            raise dimension_error
+                else:
+                    self.collection = existing_collection
+            except Exception:
+                # Collection doesn't exist, create new one
+                self.collection = self.client.get_or_create_collection(
+                    name=collection_name,
+                    metadata={"description": "Episodic memories for chatbot - OpenAI embeddings", "embedding_model": embedding_model}
+                )
+        else:
+            # Sử dụng default ChromaDB embedding
+            self.collection = self.client.get_or_create_collection(
+                name=collection_name,
+                metadata={"description": "Episodic memories for chatbot"}
+            )
+        
         self.memories: Dict[str, EpisodicMemory] = {}
     
     def add_memory(self, memory: EpisodicMemory) -> None:
         """Thêm memory vào ChromaDB"""
         text_to_embed = f"{memory.content} {memory.context}"
         
-        self.collection.add(
-            documents=[text_to_embed],
-            metadatas=[{
-                "timestamp": memory.timestamp.isoformat(),
-                "importance_score": memory.importance_score,
-                "tags": ",".join(memory.tags),
-                "access_count": memory.access_count
-            }],
-            ids=[memory.id]
-        )
-        
-        self.memories[memory.id] = memory
+        try:
+            if self.use_openai_embedding:
+                # Sử dụng OpenAI embedding
+                embedding = self._get_openai_embedding(text_to_embed)
+                if embedding:
+                    self.collection.add(
+                        documents=[text_to_embed],
+                        embeddings=[embedding],
+                        metadatas=[{
+                            "timestamp": memory.timestamp.isoformat(),
+                            "importance_score": memory.importance_score,
+                            "tags": ",".join(memory.tags),
+                            "access_count": memory.access_count
+                        }],
+                        ids=[memory.id]
+                    )
+                else:
+                    # Fallback to text-only if embedding fails
+                    self.collection.add(
+                        documents=[text_to_embed],
+                        metadatas=[{
+                            "timestamp": memory.timestamp.isoformat(),
+                            "importance_score": memory.importance_score,
+                            "tags": ",".join(memory.tags),
+                            "access_count": memory.access_count
+                        }],
+                        ids=[memory.id]
+                    )
+            else:
+                # Sử dụng default ChromaDB embedding
+                self.collection.add(
+                    documents=[text_to_embed],
+                    metadatas=[{
+                        "timestamp": memory.timestamp.isoformat(),
+                        "importance_score": memory.importance_score,
+                        "tags": ",".join(memory.tags),
+                        "access_count": memory.access_count
+                    }],
+                    ids=[memory.id]
+                )
+            
+            self.memories[memory.id] = memory
+            
+        except Exception as e:
+            if "expecting embedding with dimension" in str(e):
+                # Dimension mismatch - recreate collection
+                print(f"Dimension mismatch during add_memory. Recreating collection: {e}")
+                self._recreate_collection_for_dimension_fix()
+                # Retry adding the memory
+                self.add_memory(memory)
+            else:
+                print(f"Error adding memory to ChromaDB: {e}")
+                # Still store in local memory dict
+                self.memories[memory.id] = memory
     
     def search_similar(self, 
                       query: str, 
@@ -193,12 +310,22 @@ class ChromaMemoryStore:
         """Tìm kiếm memories tương tự"""
         if not self.memories:  # No memories to search
             return []
-            
-        results = self.collection.query(
-            query_texts=[query],
-            n_results=min(top_k, len(self.memories)),  # Don't exceed available memories
-            where=where_filter
-        )
+        
+        if self.use_openai_embedding:
+            # Sử dụng OpenAI embedding cho query
+            query_embedding = self._get_openai_embedding(query)
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=min(top_k, len(self.memories)),  # Don't exceed available memories
+                where=where_filter
+            )
+        else:
+            # Sử dụng default ChromaDB embedding
+            results = self.collection.query(
+                query_texts=[query],
+                n_results=min(top_k, len(self.memories)),  # Don't exceed available memories
+                where=where_filter
+            )
         
         memories_with_scores = []
         if results['ids'][0]:  # Check if results exist
@@ -239,6 +366,70 @@ class ChromaMemoryStore:
                     "last_accessed": memory.last_accessed.isoformat()
                 }]
             )
+    
+    def _get_openai_embedding(self, text: str) -> List[float]:
+        """Lấy embedding từ OpenAI API với caching"""
+        if not self.use_openai_embedding:
+            return []
+        
+        # Check cache first
+        if text in self.embedding_cache:
+            return self.embedding_cache[text]
+        
+        try:
+            # Call OpenAI embedding API
+            response = self.openai_client.embeddings.create(
+                model=self.embedding_model,
+                input=text
+            )
+            
+            embedding = response.data[0].embedding
+            
+            # Cache the embedding
+            self.embedding_cache[text] = embedding
+            
+            return embedding
+            
+        except Exception as e:
+            print(f"Lỗi khi lấy embedding: {e}")
+            # Return None to trigger fallback behavior
+            return None
+    
+    def _recreate_collection_for_dimension_fix(self):
+        """Recreate collection để fix dimension mismatch"""
+        try:
+            # Backup existing memories nếu có
+            existing_memories = dict(self.memories)
+            
+            # Delete current collection
+            self.client.delete_collection(name=self.collection_name)
+            print(f"Deleted existing collection '{self.collection_name}' due to dimension mismatch")
+            
+            # Create new collection
+            self.collection = self.client.create_collection(
+                name=self.collection_name,
+                metadata={"description": "Episodic memories for chatbot - OpenAI embeddings", "embedding_model": self.embedding_model}
+            )
+            print(f"Created new collection '{self.collection_name}' with correct dimensions")
+            
+            # Clear local memories để trigger re-add
+            self.memories = {}
+            
+            # Re-add existing memories if any (will use correct dimensions now)
+            for memory_id, memory in existing_memories.items():
+                try:
+                    self.add_memory(memory)
+                    print(f"Re-added memory {memory_id} with correct dimensions")
+                except Exception as e:
+                    print(f"Failed to re-add memory {memory_id}: {e}")
+                    
+        except Exception as e:
+            print(f"Error recreating collection: {e}")
+            # Create new collection without backup
+            self.collection = self.client.create_collection(
+                name=self.collection_name,
+                metadata={"description": "Episodic memories for chatbot - OpenAI embeddings", "embedding_model": self.embedding_model}
+            )
 
 
 class RetrievalAugmentedMemory:
@@ -248,16 +439,18 @@ class RetrievalAugmentedMemory:
                  store_type: str = "chroma",  # "faiss" or "chroma"
                  max_memories: int = 10000,
                  decay_factor: float = 0.95,
-                 importance_threshold: float = 0.1):
+                 importance_threshold: float = 0.1,
+                 use_openai_embedding: bool = True):
         self.max_memories = max_memories
         self.decay_factor = decay_factor
         self.importance_threshold = importance_threshold
+        self.use_openai_embedding = use_openai_embedding
         
         # Initialize memory store
         if store_type == "faiss":
             self.store = VectorMemoryStore()
         else:
-            self.store = ChromaMemoryStore()
+            self.store = ChromaMemoryStore(use_openai_embedding=use_openai_embedding)
         
         self.forgetting_scheduler_days = 7  # Run forgetting every 7 days
         self.last_forgetting_run = datetime.now()
