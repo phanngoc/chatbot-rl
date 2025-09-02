@@ -357,7 +357,7 @@ class RLChatbotModel:
 
 
 class RLChatbotAgent:
-    """Main RL Chatbot Agent tích hợp tất cả components"""
+    """Main RL Chatbot Agent tích hợp tất cả components với session-based memory"""
     
     def __init__(self,
                  openai_model: str = "gpt-3.5-turbo",
@@ -376,10 +376,14 @@ class RLChatbotAgent:
             temperature=self.config.get("temperature", 0.8)
         )
         
+        # Session management
+        self.current_session_id = None
+        self._session_manager = None
+        
         # Initialize all RL components
         self._initialize_components()
         
-        # Conversation state
+        # Conversation state (deprecated - chuyển sang session-based)
         self.current_conversation_id = None
         self.conversation_history = []
         
@@ -433,13 +437,14 @@ class RLChatbotAgent:
         #     "memory_retention_scores": []
         # }
         
-        # Meta-learning System
+        # Meta-learning System với session support
         self.meta_learning_system = MetaLearningEpisodicSystem(
             input_size=768,
             hidden_size=256,
             memory_size=self.config.get("meta_memory_size", 1000),
             memory_dim=256,  # Fixed: match with hidden_size
-            output_size=768
+            output_size=768,
+            session_id=self.current_session_id  # Sẽ update sau khi có session
         )
         
         # Temporal Weighting System
@@ -486,13 +491,77 @@ class RLChatbotAgent:
         return logger
     
     def start_conversation(self, user_id: str = None) -> str:
-        """Bắt đầu conversation mới"""
-        self.current_conversation_id = str(uuid.uuid4())
+        """Bắt đầu conversation mới - Deprecated, sử dụng start_session thay thế"""
+        return self.start_session(user_id or "default")
+    
+    def start_session(self, user_id: str = "default") -> str:
+        """Bắt đầu session mới với database persistence"""
+        session_manager = self._get_session_manager()
+        if session_manager:
+            # Tạo session mới trong database
+            session_id = session_manager.create_new_session(
+                user_id=user_id,
+                session_metadata={
+                    "agent_config": self.config,
+                    "model_name": self.model.openai_model,
+                    "created_by": "RLChatbotAgent"
+                }
+            )
+        else:
+            # Fallback to in-memory
+            session_id = str(uuid.uuid4())
+            self.logger.warning("Using in-memory session management")
+        
+        # Set current session
+        self.current_session_id = session_id
+        
+        # Update meta-learning system với session ID
+        self.meta_learning_system.set_session_id(session_id)
+        
+        # Reset conversation history (deprecated usage)
+        self.current_conversation_id = session_id
         self.conversation_history = []
         
-        self.logger.info(f"Bắt đầu conversation mới: {self.current_conversation_id}")
-        
-        return self.current_conversation_id
+        self.logger.info(f"Started new session: {session_id}")
+        return session_id
+    
+    def resume_session(self, session_id: str) -> bool:
+        """Resume existing session"""
+        session_manager = self._get_session_manager()
+        if session_manager and session_manager.is_session_valid(session_id):
+            self.current_session_id = session_id
+            
+            # Update meta-learning system
+            self.meta_learning_system.set_session_id(session_id)
+            
+            # Load conversation history cho compatibility
+            try:
+                conversation = session_manager.get_conversation_history(session_id, limit=50)
+                self.conversation_history = [
+                    {"role": msg["role"], "content": msg["content"]} 
+                    for msg in conversation
+                ]
+                self.current_conversation_id = session_id
+            except Exception as e:
+                self.logger.warning(f"Failed to load conversation history: {e}")
+                self.conversation_history = []
+            
+            self.logger.info(f"Resumed session: {session_id}")
+            return True
+        else:
+            self.logger.error(f"Cannot resume invalid session: {session_id}")
+            return False
+    
+    def _get_session_manager(self):
+        """Lazy load session manager"""
+        if self._session_manager is None:
+            try:
+                from database.session_manager import get_session_manager
+                self._session_manager = get_session_manager()
+            except ImportError as e:
+                self.logger.warning(f"Could not import session manager: {e}")
+                return None
+        return self._session_manager
     
     def process_message(self, 
                        user_message: str,
@@ -502,8 +571,8 @@ class RLChatbotAgent:
         
         start_time = datetime.now()
         
-        if not self.current_conversation_id:
-            self.start_conversation()
+        if not self.current_session_id:
+            self.start_session()
         
         # 1. Retrieve relevant memories
         relevant_memories = self._retrieve_relevant_memories(user_message, context)
@@ -515,7 +584,39 @@ class RLChatbotAgent:
         # 3. Store experience
         experience_id = self._store_experience(user_message, response_text, context, user_feedback)
         
-        # 4. Update conversation history
+        # 4. Save messages to database
+        session_manager = self._get_session_manager()
+        if session_manager and self.current_session_id:
+            try:
+                # Save user message
+                user_message_id = session_manager.add_message_to_session(
+                    self.current_session_id,
+                    "user",
+                    user_message,
+                    metadata={
+                        "context": context,
+                        "timestamp": start_time.isoformat(),
+                        "relevant_memories_count": len(relevant_memories)
+                    }
+                )
+                
+                # Save bot response
+                bot_message_id = session_manager.add_message_to_session(
+                    self.current_session_id,
+                    "assistant",
+                    response_text,
+                    metadata={
+                        "experience_id": experience_id,
+                        "value_estimate": response_data.get("value_estimate", 0.0),
+                        "model_used": response_data.get("model_used", "unknown"),
+                        "openai_usage": response_data.get("usage", {}),
+                        "response_time_ms": (datetime.now() - start_time).total_seconds() * 1000
+                    }
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to save messages to database: {e}")
+        
+        # Update conversation history (deprecated usage để backward compatibility)
         self.conversation_history.append({
             "user_message": user_message,
             "bot_response": response_text,
@@ -533,9 +634,16 @@ class RLChatbotAgent:
         # 7. Periodic weight updates
         self.temporal_weighting.batch_update_weights()
         
+        # 8. Auto-save memory bank
+        try:
+            self.meta_learning_system.auto_save_memory(save_interval=5)
+        except Exception as e:
+            self.logger.warning(f"Failed to auto-save memory: {e}")
+        
         return {
             "response": response_text,
-            "conversation_id": self.current_conversation_id,
+            "conversation_id": self.current_conversation_id,  # For backward compatibility
+            "session_id": self.current_session_id,
             "experience_id": experience_id,
             "relevant_memories_count": len(relevant_memories),
             "response_time_ms": (datetime.now() - start_time).total_seconds() * 1000,
@@ -772,7 +880,7 @@ class RLChatbotAgent:
                 reward=reward,
                 next_state="",  # Will be filled by next interaction
                 timestamp=timestamp,
-                conversation_id=self.current_conversation_id,
+                conversation_id=self.current_session_id or self.current_conversation_id,
                 user_feedback=str(user_feedback) if user_feedback is not None else None
             )
             if hasattr(self.experience_buffer, 'add_experience'):
@@ -819,7 +927,7 @@ class RLChatbotAgent:
         # 3. Store trong Meta-learning System (vẫn giữ)
         try:
             if hasattr(self.meta_learning_system, 'store_episodic_experience'):
-                self.meta_learning_system.store_episodic_experience(
+                self.meta_learning_system.store_episodic_experience_with_autosave(
                     context=f"{context} {user_message}".strip(),
                     response=bot_response,
                     reward=reward,
@@ -1234,6 +1342,107 @@ class RLChatbotAgent:
         except Exception as e:
             self.logger.error(f"Lỗi khi load agent state: {e}")
             return False
+    
+    # === Session Management Methods ===
+    
+    def get_session_summary(self) -> Dict[str, Any]:
+        """Lấy tóm tắt session hiện tại"""
+        if not self.current_session_id:
+            return {"error": "No active session"}
+        
+        session_manager = self._get_session_manager()
+        if session_manager:
+            try:
+                return session_manager.get_session_summary(self.current_session_id)
+            except Exception as e:
+                self.logger.error(f"Failed to get session summary: {e}")
+        
+        # Fallback summary
+        return {
+            "session_id": self.current_session_id,
+            "conversation_history_length": len(self.conversation_history),
+            "total_interactions": self.performance_metrics["total_interactions"],
+            "memory_stats": self._get_memory_stats()
+        }
+    
+    def list_recent_sessions(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Liệt kê các sessions gần đây"""
+        session_manager = self._get_session_manager()
+        if session_manager:
+            try:
+                return session_manager.get_recent_sessions(limit)
+            except Exception as e:
+                self.logger.error(f"Failed to list sessions: {e}")
+        
+        return []
+    
+    def switch_to_session(self, session_id: str) -> bool:
+        """Chuyển sang session khác"""
+        if self.resume_session(session_id):
+            self.logger.info(f"Switched to session: {session_id}")
+            return True
+        return False
+    
+    def clear_current_session_memory(self):
+        """Clear memory của session hiện tại"""
+        if self.current_session_id:
+            try:
+                self.meta_learning_system.clear_session_memory(self.current_session_id)
+                self.logger.info(f"Cleared memory for session: {self.current_session_id}")
+            except Exception as e:
+                self.logger.error(f"Failed to clear session memory: {e}")
+    
+    def export_current_session(self, output_path: str) -> bool:
+        """Export session hiện tại ra file"""
+        if not self.current_session_id:
+            self.logger.error("No active session to export")
+            return False
+        
+        session_manager = self._get_session_manager()
+        if session_manager:
+            try:
+                session_manager.export_session(self.current_session_id, output_path)
+                self.logger.info(f"Exported session to: {output_path}")
+                return True
+            except Exception as e:
+                self.logger.error(f"Failed to export session: {e}")
+        
+        return False
+    
+    def force_save_memory(self) -> bool:
+        """Force save memory bank ngay lập tức"""
+        try:
+            return self.meta_learning_system.save_memory_to_database(force_save=True)
+        except Exception as e:
+            self.logger.error(f"Failed to force save memory: {e}")
+            return False
+    
+    def get_database_stats(self) -> Dict[str, Any]:
+        """Lấy thống kê database"""
+        session_manager = self._get_session_manager()
+        if session_manager:
+            try:
+                db_manager = session_manager.db_manager
+                return db_manager.get_database_stats()
+            except Exception as e:
+                self.logger.error(f"Failed to get database stats: {e}")
+        
+        return {"error": "Database not available"}
+    
+    def cleanup_old_data(self, days_threshold: int = 30) -> Dict[str, int]:
+        """Clean up old sessions và data"""
+        session_manager = self._get_session_manager()
+        results = {"sessions_cleaned": 0}
+        
+        if session_manager:
+            try:
+                sessions_cleaned = session_manager.cleanup_old_sessions(days_threshold)
+                results["sessions_cleaned"] = sessions_cleaned
+                self.logger.info(f"Cleaned up {sessions_cleaned} old sessions")
+            except Exception as e:
+                self.logger.error(f"Failed to cleanup old data: {e}")
+        
+        return results
     
     def _finish_conversation_ewc_task(self) -> bool:
         """EWC functionality removed - stub for compatibility"""

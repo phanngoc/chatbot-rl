@@ -64,10 +64,17 @@ def chat_interface():
     
     agent = st.session_state.agent
     
-    # Start conversation if needed
+    # Start session if needed
     if not st.session_state.conversation_id:
-        st.session_state.conversation_id = agent.start_conversation()
-        st.success(f"Bắt đầu cuộc trò chuyện mới: {st.session_state.conversation_id}")
+        # Use new session-based approach
+        session_id = agent.start_session()
+        st.session_state.conversation_id = session_id
+        st.success(f"Bắt đầu phiên trò chuyện mới: {session_id}")
+        
+        # Show session info
+        with st.expander("📊 Thông tin Session", expanded=False):
+            session_summary = agent.get_session_summary()
+            st.json(session_summary)
     
     # Chat input
     user_input = st.chat_input("Nhập tin nhắn của bạn...")
@@ -407,6 +414,157 @@ def memory_explorer():
         st.info("Chưa có knowledge nào được consolidate")
 
 
+def session_management():
+    """Session Management interface với database integration"""
+    st.header("📚 Quản lý Session")
+    
+    agent = st.session_state.agent
+    
+    # Current session info
+    if st.session_state.conversation_id:
+        st.subheader("Session hiện tại")
+        
+        # Session summary
+        try:
+            session_summary = agent.get_session_summary()
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Session ID", session_summary.get("session_id", "Unknown")[:8] + "...")
+            with col2:
+                st.metric("Tổng tin nhắn", session_summary.get("total_messages", 0))
+            with col3:
+                st.metric("Memory Bank Size", session_summary.get("memory_stats", {}).get("total_entries", 0))
+            
+            # Detailed session info
+            with st.expander("Chi tiết Session", expanded=False):
+                st.json(session_summary)
+        
+        except Exception as e:
+            st.error(f"Lỗi khi lấy thông tin session: {e}")
+        
+        # Session actions
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("🔄 Bắt đầu session mới"):
+                session_id = agent.start_session()
+                st.session_state.conversation_id = session_id
+                st.session_state.conversation_history = []
+                st.success(f"Đã tạo session mới: {session_id[:8]}...")
+                st.rerun()
+        
+        with col2:
+            if st.button("💾 Lưu Memory Bank"):
+                if agent.force_save_memory():
+                    st.success("Đã lưu memory bank!")
+                else:
+                    st.error("Lỗi khi lưu memory bank")
+        
+        with col3:
+            if st.button("🗑️ Clear Memory"):
+                agent.clear_current_session_memory()
+                st.success("Đã xóa memory của session!")
+    
+    # Recent sessions
+    st.subheader("Sessions gần đây")
+    try:
+        recent_sessions = agent.list_recent_sessions(10)
+        
+        if recent_sessions:
+            for session in recent_sessions:
+                with st.container():
+                    col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
+                    
+                    with col1:
+                        st.text(f"ID: {session['session_id'][:8]}...")
+                    
+                    with col2:
+                        st.text(f"Messages: {session['total_messages']}")
+                    
+                    with col3:
+                        last_updated = session.get('last_updated')
+                        if isinstance(last_updated, str):
+                            last_updated = last_updated[:16]  # Truncate datetime
+                        st.text(f"Updated: {last_updated}")
+                    
+                    with col4:
+                        if st.button("Resume", key=f"resume_{session['session_id']}"):
+                            if agent.resume_session(session['session_id']):
+                                st.session_state.conversation_id = session['session_id']
+                                st.success("Đã chuyển sang session!")
+                                st.rerun()
+                            else:
+                                st.error("Không thể resume session")
+        else:
+            st.info("Chưa có sessions nào")
+    
+    except Exception as e:
+        st.error(f"Lỗi khi load sessions: {e}")
+    
+    # Database statistics
+    st.subheader("Thống kê Database")
+    try:
+        db_stats = agent.get_database_stats()
+        
+        if "error" not in db_stats:
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Tổng Sessions", db_stats.get("total_sessions", 0))
+            
+            with col2:
+                st.metric("Tổng Messages", db_stats.get("total_messages", 0))
+            
+            with col3:
+                st.metric("Active Sessions (7 days)", db_stats.get("recent_active_sessions", 0))
+            
+            # Detailed stats
+            with st.expander("Chi tiết Database", expanded=False):
+                st.json(db_stats)
+        else:
+            st.warning("Database không khả dụng")
+    
+    except Exception as e:
+        st.error(f"Lỗi database stats: {e}")
+    
+    # Advanced actions
+    st.subheader("Hành động nâng cao")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("🧠 Meta-learning Session"):
+            with st.spinner("Running meta-learning..."):
+                try:
+                    results = agent.meta_learning_system.meta_learning_session(num_episodes=5)
+                    st.json(results)
+                except Exception as e:
+                    st.error(f"Meta-learning failed: {e}")
+    
+    with col2:
+        if st.button("🗑️ Cleanup Old Data"):
+            with st.spinner("Cleaning up old data..."):
+                try:
+                    cleanup_results = agent.cleanup_old_data(days_threshold=30)
+                    st.success(f"Cleaned up {cleanup_results['sessions_cleaned']} sessions")
+                except Exception as e:
+                    st.error(f"Cleanup failed: {e}")
+    
+    with col3:
+        if st.button("📤 Export Current Session"):
+            if st.session_state.conversation_id:
+                output_path = f"data/session_export_{st.session_state.conversation_id[:8]}.json"
+                try:
+                    if agent.export_current_session(output_path):
+                        st.success(f"Exported to: {output_path}")
+                    else:
+                        st.error("Export failed")
+                except Exception as e:
+                    st.error(f"Export error: {e}")
+            else:
+                st.warning("No active session to export")
+
+
 def settings_page():
     """Settings and configuration page"""
     st.header("⚙️ Cài đặt")
@@ -502,7 +660,7 @@ def main():
         
         page = st.selectbox(
             "Chọn trang:",
-            ["💬 Trò chuyện", "📊 Phân tích", "🔍 Khám phá bộ nhớ", "⚙️ Cài đặt"]
+            ["💬 Trò chuyện", "📚 Quản lý Session", "📊 Phân tích", "🔍 Khám phá bộ nhớ", "⚙️ Cài đặt"]
         )
         
         st.markdown("---")
@@ -517,6 +675,8 @@ def main():
     # Main content
     if page == "💬 Trò chuyện":
         chat_interface()
+    elif page == "📚 Quản lý Session":
+        session_management()
     elif page == "📊 Phân tích":
         analytics_dashboard()
     elif page == "🔍 Khám phá bộ nhớ":

@@ -14,6 +14,7 @@ import math
 from collections import defaultdict
 import json
 import os
+import logging
 
 
 @dataclass
@@ -340,6 +341,7 @@ class MetaLearningEpisodicSystem:
     """
     Main system cho meta-learning với episodic memory
     Học cách select và activate relevant experiences
+    Tích hợp với database persistence cho session-based memory
     """
     
     def __init__(self,
@@ -347,7 +349,12 @@ class MetaLearningEpisodicSystem:
                  hidden_size: int = 256,
                  memory_size: int = 1000,
                  memory_dim: int = 128,
-                 output_size: int = 768):
+                 output_size: int = 768,
+                 session_id: str = None):
+        
+        # Session management
+        self.session_id = session_id
+        self.logger = logging.getLogger("MetaLearningEpisodicSystem")
         
         # Initialize MANN
         self.mann = MemoryAugmentedNetwork(
@@ -370,6 +377,14 @@ class MetaLearningEpisodicSystem:
             "avg_adaptation_loss": 0.0,
             "memory_utilization": 0.0
         }
+        
+        # Database integration (lazy import để tránh circular dependency)
+        self._session_manager = None
+        self._memory_loaded = False
+        
+        # Load memory bank từ database nếu có session_id
+        if self.session_id:
+            self._ensure_memory_loaded()
     
     def meta_train_episode(self, 
                           support_data: List[Dict],
@@ -602,12 +617,24 @@ class MetaLearningEpisodicSystem:
         """Thống kê tổng thể của system"""
         memory_stats = self.mann.get_memory_statistics()
         
-        return {
+        stats = {
             "meta_learning": self.meta_learning_stats,
             "memory_bank": memory_stats,
             "experience_buffer_size": len(self.experience_buffer),
-            "total_experiences_stored": len(self.experience_buffer)
+            "total_experiences_stored": len(self.experience_buffer),
+            "session_id": self.session_id,
+            "memory_loaded_from_db": self._memory_loaded
         }
+        
+        # Add database stats nếu có session
+        if self.session_id and self._get_session_manager():
+            try:
+                db_stats = self._get_session_manager().get_session_memory_stats(self.session_id)
+                stats["database_memory_stats"] = db_stats
+            except Exception as e:
+                self.logger.warning(f"Failed to get database stats: {e}")
+        
+        return stats
     
     def save_system(self, filepath: str) -> None:
         """Lưu toàn bộ system"""
@@ -662,3 +689,162 @@ class MetaLearningEpisodicSystem:
         except Exception as e:
             print(f"Lỗi khi load system: {e}")
             return False
+    
+    # === Database Integration Methods ===
+    
+    def _get_session_manager(self):
+        """Lazy load session manager để tránh circular import"""
+        if self._session_manager is None:
+            try:
+                from database.session_manager import get_session_manager
+                self._session_manager = get_session_manager()
+            except ImportError as e:
+                self.logger.warning(f"Could not import session manager: {e}")
+                return None
+        return self._session_manager
+    
+    def set_session_id(self, session_id: str):
+        """Set session ID và load memory từ database"""
+        self.session_id = session_id
+        self._memory_loaded = False
+        if session_id:
+            self._ensure_memory_loaded()
+    
+    def _ensure_memory_loaded(self):
+        """Đảm bảo memory bank đã được load từ database"""
+        if self._memory_loaded or not self.session_id:
+            return
+        
+        session_manager = self._get_session_manager()
+        if not session_manager:
+            self.logger.warning("Session manager not available, using in-memory only")
+            return
+        
+        try:
+            # Load memory bank từ database
+            memory_entries, timestep = session_manager.load_memory_bank_for_session(
+                self.session_id, 
+                device=self.mann.device
+            )
+            
+            if memory_entries:
+                # Update MANN memory bank
+                self.mann.memory_bank = memory_entries
+                self.mann.timestep = timestep
+                self._memory_loaded = True
+                
+                self.logger.info(f"Loaded {len(memory_entries)} memory entries from database for session {self.session_id}")
+            else:
+                self.logger.info(f"No existing memory found for session {self.session_id}, starting fresh")
+                self._memory_loaded = True
+                
+        except Exception as e:
+            self.logger.error(f"Failed to load memory from database: {e}")
+            # Continue với empty memory bank
+            self._memory_loaded = True
+    
+    def save_memory_to_database(self, force_save: bool = False):
+        """Lưu memory bank hiện tại vào database"""
+        if not self.session_id:
+            self.logger.warning("No session ID set, cannot save to database")
+            return False
+        
+        session_manager = self._get_session_manager()
+        if not session_manager:
+            self.logger.warning("Session manager not available")
+            return False
+        
+        try:
+            # Ensure memory is loaded first
+            self._ensure_memory_loaded()
+            
+            # Save current memory bank state
+            session_manager.save_memory_bank_for_session(
+                self.session_id,
+                self.mann.memory_bank,
+                self.mann.timestep
+            )
+            
+            self.logger.info(f"Saved memory bank to database for session {self.session_id}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save memory to database: {e}")
+            return False
+    
+    def auto_save_memory(self, save_interval: int = 10):
+        """Auto-save memory bank theo interval (mỗi N operations)"""
+        if hasattr(self, '_last_save_timestep'):
+            steps_since_save = self.mann.timestep - self._last_save_timestep
+            if steps_since_save >= save_interval:
+                if self.save_memory_to_database():
+                    self._last_save_timestep = self.mann.timestep
+        else:
+            self._last_save_timestep = 0
+            self.save_memory_to_database()
+    
+    def store_episodic_experience_with_autosave(self, 
+                                               context: str,
+                                               response: str,
+                                               reward: float,
+                                               user_feedback: Optional[str] = None) -> None:
+        """Store experience và auto-save khi cần"""
+        # Call original method
+        self.store_episodic_experience(context, response, reward, user_feedback)
+        
+        # Auto-save theo interval
+        self.auto_save_memory(save_interval=5)  # Save mỗi 5 experiences
+    
+    def get_memory_for_session(self, session_id: str = None) -> List[MemoryBankEntry]:
+        """Lấy memory bank cho session cụ thể"""
+        if session_id is None:
+            session_id = self.session_id
+        
+        if not session_id:
+            return self.mann.memory_bank
+        
+        session_manager = self._get_session_manager()
+        if not session_manager:
+            return self.mann.memory_bank
+        
+        try:
+            memory_entries, _ = session_manager.load_memory_bank_for_session(
+                session_id, 
+                device=self.mann.device
+            )
+            return memory_entries
+        except Exception as e:
+            self.logger.error(f"Failed to load memory for session {session_id}: {e}")
+            return []
+    
+    def clear_session_memory(self, session_id: str = None):
+        """Clear memory cho session (for testing/reset)"""
+        if session_id is None:
+            session_id = self.session_id
+        
+        if session_id:
+            # Clear trong database
+            session_manager = self._get_session_manager()
+            if session_manager:
+                try:
+                    # Save empty memory bank
+                    session_manager.save_memory_bank_for_session(session_id, [], 0)
+                    self.logger.info(f"Cleared memory for session {session_id}")
+                except Exception as e:
+                    self.logger.error(f"Failed to clear session memory: {e}")
+        
+        # Clear current memory nếu đây là current session
+        if session_id == self.session_id or session_id is None:
+            # Reset memory bank
+            memory_size = len(self.mann.memory_bank)
+            memory_dim = self.mann.memory_dim
+            device = self.mann.device
+            
+            self.mann.memory_bank = [
+                MemoryBankEntry(
+                    key=torch.randn(memory_dim, device=device),
+                    value=torch.randn(memory_dim, device=device)
+                ) for _ in range(memory_size)
+            ]
+            self.mann.timestep = 0
+            self._memory_loaded = True
