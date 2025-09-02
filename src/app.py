@@ -352,51 +352,241 @@ def memory_explorer():
     
     agent = st.session_state.agent
     
-    # Search interface
-    st.subheader("🔎 Tìm kiếm memories")
+    # Tab interface cho different memory types
+    tab1, tab2, tab3, tab4 = st.tabs(["🔎 Search Memories", "🧠 Episodic Experiences", "📚 Memory Bank", "📝 Recent Experiences"])
     
-    search_query = st.text_input("Nhập từ khóa tìm kiếm:")
-    
-    if search_query:
-        # Search in retrieval memory
-        memories = agent.retrieval_memory.retrieve_relevant_memories(
-            search_query, top_k=10
-        )
+    with tab1:
+        # Search interface
+        st.subheader("🔎 Tìm kiếm memories")
         
-        if memories:
-            st.success(f"Tìm thấy {len(memories)} memories liên quan")
+        search_query = st.text_input("Nhập từ khóa tìm kiếm:")
+        
+        if search_query:
+            # Search in retrieval memory
+            memories = agent.retrieval_memory.retrieve_relevant_memories(
+                search_query, top_k=10
+            )
             
-            for i, memory in enumerate(memories):
-                with st.expander(f"Memory {i+1} - Similarity: {memory['similarity']:.3f}"):
-                    st.write("**Content:**", memory['content'])
-                    st.write("**Context:**", memory['context'])
-                    st.write("**Importance:**", memory['importance_score'])
-                    st.write("**Access Count:**", memory['access_count'])
-                    st.write("**Tags:**", ", ".join(memory['tags']))
-                    
-                    if memory['metadata']:
-                        st.write("**Metadata:**", memory['metadata'])
-        else:
-            st.info("Không tìm thấy memories nào")
+            if memories:
+                st.success(f"Tìm thấy {len(memories)} memories liên quan")
+                
+                for i, memory in enumerate(memories):
+                    with st.expander(f"Memory {i+1} - Similarity: {memory['similarity']:.3f}"):
+                        st.write("**Content:**", memory['content'])
+                        st.write("**Context:**", memory['context'])
+                        st.write("**Importance:**", memory['importance_score'])
+                        st.write("**Access Count:**", memory['access_count'])
+                        st.write("**Tags:**", ", ".join(memory['tags']))
+                        
+                        if memory['metadata']:
+                            st.write("**Metadata:**", memory['metadata'])
+            else:
+                st.info("Không tìm thấy memories nào")
     
-    # Recent experiences
-    st.subheader("📝 Experiences gần đây")
-    
-    if len(agent.experience_buffer.buffer) > 0:
-        recent_experiences = list(agent.experience_buffer.buffer)[-10:]  # Last 10
+    with tab2:
+        # Episodic Experiences từ Meta-Learning System
+        st.subheader("🧠 Episodic Experiences")
         
-        for i, exp in enumerate(reversed(recent_experiences)):
-            with st.expander(f"Experience {i+1} - Reward: {exp.reward:.2f}"):
-                st.write("**State:**", exp.state)
-                st.write("**Action:**", exp.action)
-                st.write("**Reward:**", exp.reward)
-                st.write("**Timestamp:**", exp.timestamp.strftime("%Y-%m-%d %H:%M:%S"))
-                if exp.user_feedback:
-                    st.write("**User Feedback:**", exp.user_feedback)
-    else:
-        st.info("Chưa có experiences nào")
+        try:
+            meta_stats = agent.meta_learning_system.get_system_statistics()
+            experience_buffer = agent.meta_learning_system.experience_buffer
+            
+            # Summary stats
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Tổng Experiences", len(experience_buffer))
+            with col2:
+                st.metric("Episodes Trained", meta_stats['meta_learning']['episodes_trained'])
+            with col3:
+                st.metric("Avg Adaptation Loss", f"{meta_stats['meta_learning']['avg_adaptation_loss']:.4f}")
+            with col4:
+                st.metric("Memory Utilization", f"{meta_stats['meta_learning']['memory_utilization']:.2f}")
+            
+            # Experience filtering
+            col1, col2 = st.columns(2)
+            with col1:
+                experience_count = st.slider("Số lượng experiences hiển thị", 5, 50, 10)
+            with col2:
+                sort_by = st.selectbox("Sắp xếp theo", ["Mới nhất", "Reward cao nhất", "Reward thấp nhất"])
+            
+            if experience_buffer:
+                # Sort experiences
+                experiences = list(experience_buffer)
+                if sort_by == "Reward cao nhất":
+                    experiences.sort(key=lambda x: x.get('reward', 0), reverse=True)
+                elif sort_by == "Reward thấp nhất":
+                    experiences.sort(key=lambda x: x.get('reward', 0))
+                # "Mới nhất" keeps original order (most recent last)
+                
+                # Limit to requested count
+                shown_experiences = experiences[-experience_count:] if sort_by == "Mới nhất" else experiences[:experience_count]
+                
+                st.write(f"**Hiển thị {len(shown_experiences)} experiences:**")
+                
+                for i, exp in enumerate(shown_experiences):
+                    reward = exp.get('reward', 0)
+                    reward_color = "🟢" if reward > 0 else "🔴" if reward < 0 else "🔵"
+                    
+                    with st.expander(f"{reward_color} Experience {i+1} - Reward: {reward:.3f}"):
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            st.write("**Context:**")
+                            context = exp.get('context', '')
+                            st.text_area("", context, height=120, key=f"episodic_context_{i}", disabled=True)
+                            
+                            st.write("**Metrics:**")
+                            st.write(f"• Reward: **{reward:.3f}**")
+                            if exp.get('user_feedback'):
+                                st.write(f"• User Feedback: **{exp['user_feedback']}**")
+                        
+                        with col2:
+                            st.write("**Response:**")
+                            response = exp.get('response', '')
+                            st.text_area("", response, height=120, key=f"episodic_response_{i}", disabled=True)
+                            
+                            timestamp = exp.get('timestamp')
+                            if timestamp:
+                                if hasattr(timestamp, 'isoformat'):
+                                    st.write(f"**Timestamp:** {timestamp.isoformat()}")
+                                elif hasattr(timestamp, 'item'):  # Tensor timestamp
+                                    st.write(f"**Timestep:** {timestamp.item()}")
+                                else:
+                                    st.write(f"**Timestamp:** {str(timestamp)}")
+            else:
+                st.info("Chưa có episodic experiences nào trong meta-learning system")
+                
+        except Exception as e:
+            st.error(f"Lỗi khi load episodic experiences: {e}")
     
-    # Consolidated knowledge
+    with tab3:
+        # Memory Bank từ Meta-Learning
+        st.subheader("📚 Memory Bank Entries")
+        
+        try:
+            # Search trong memory bank
+            search_query_mb = st.text_input("Tìm kiếm trong Memory Bank:", key="mb_search")
+            top_k = st.slider("Số lượng memories", 1, 20, 5)
+            
+            if search_query_mb:
+                memories = agent.meta_learning_system.select_relevant_memories(
+                    search_query_mb, top_k=top_k
+                )
+                
+                if memories:
+                    st.success(f"Tìm thấy {len(memories)} memory entries")
+                    
+                    for i, memory in enumerate(memories):
+                        similarity = memory.get('similarity', 0)
+                        importance = memory.get('importance_weight', 1.0)
+                        usage = memory.get('usage_count', 0)
+                        
+                        # Color coding based on quality
+                        if similarity > 0.8 and importance > 1.5:
+                            quality_icon = "🔥"
+                            quality_text = "High Quality"
+                        elif similarity > 0.6:
+                            quality_icon = "⭐"
+                            quality_text = "Good Quality"
+                        else:
+                            quality_icon = "💡"
+                            quality_text = "Low Quality"
+                        
+                        with st.expander(f"{quality_icon} Memory {i+1} - {quality_text} (Sim: {similarity:.3f})"):
+                            col1, col2, col3 = st.columns(3)
+                            
+                            with col1:
+                                st.metric("Similarity", f"{similarity:.3f}")
+                            with col2:
+                                st.metric("Importance", f"{importance:.2f}")
+                            with col3:
+                                st.metric("Usage Count", usage)
+                            
+                            st.write("**Memory Details:**")
+                            st.write(f"• Memory Index: {memory.get('memory_index', 'Unknown')}")
+                            
+                            # Thêm metadata nếu có
+                            if hasattr(agent.meta_learning_system.mann, 'memory_bank'):
+                                memory_idx = memory.get('memory_index', -1)
+                                if memory_idx != -1 and memory_idx < len(agent.meta_learning_system.mann.memory_bank):
+                                    entry = agent.meta_learning_system.mann.memory_bank[memory_idx]
+                                    st.write(f"• Last Accessed: {entry.last_accessed}")
+                                    st.write(f"• Key Shape: {entry.key.shape}")
+                                    st.write(f"• Value Shape: {entry.value.shape}")
+                else:
+                    st.info("Không tìm thấy memories nào với query này")
+            else:
+                st.info("Nhập query để tìm kiếm trong memory bank")
+                
+        except Exception as e:
+            st.error(f"Lỗi khi truy cập memory bank: {e}")
+    
+    with tab4:
+        # Recent experiences từ Experience Buffer
+        st.subheader("📝 Recent Experience Buffer")
+        
+        if len(agent.experience_buffer.buffer) > 0:
+            # Buffer statistics
+            try:
+                buffer_stats = agent.experience_buffer.get_statistics()
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total Experiences", buffer_stats.get('total_experiences', 0))
+                with col2:
+                    st.metric("Buffer Utilization", f"{buffer_stats.get('buffer_utilization', 0):.1f}%")
+                with col3:
+                    st.metric("Avg Reward", f"{buffer_stats.get('avg_reward', 0):.3f}")
+                with col4:
+                    st.metric("Conversations", buffer_stats.get('total_conversations', 0))
+            except Exception as e:
+                st.error(f"Error loading buffer statistics: {e}")
+                # Fallback metrics
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total Experiences", len(agent.experience_buffer.buffer))
+                with col2:
+                    st.metric("Buffer Utilization", "N/A")
+                with col3:
+                    st.metric("Avg Reward", "N/A")
+                with col4:
+                    st.metric("Conversations", "N/A")
+            
+            # Experience filtering
+            exp_count = st.slider("Số lượng experiences", 5, 30, 10, key="exp_buffer_count")
+            
+            recent_experiences = list(agent.experience_buffer.buffer)[-exp_count:]  # Last N
+            
+            st.write(f"**{len(recent_experiences)} experiences gần đây từ Experience Buffer:**")
+            
+            for i, exp in enumerate(reversed(recent_experiences)):
+                reward = exp.reward
+                reward_color = "🟢" if reward > 0 else "🔴" if reward < 0 else "🔵"
+                
+                with st.expander(f"{reward_color} Experience {i+1} - Reward: {reward:.3f}"):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.write("**State (Context):**")
+                        st.text_area("", exp.state, height=100, key=f"exp_buf_state_{i}", disabled=True)
+                        
+                        st.write("**Metrics:**")
+                        st.write(f"• Reward: **{reward:.3f}**")
+                        st.write(f"• Conversation ID: {exp.conversation_id}")
+                        if exp.user_feedback:
+                            st.write(f"• User Feedback: **{exp.user_feedback}**")
+                    
+                    with col2:
+                        st.write("**Action (Response):**")
+                        st.text_area("", exp.action, height=100, key=f"exp_buf_action_{i}", disabled=True)
+                        
+                        st.write("**Timestamp:**", exp.timestamp.strftime("%Y-%m-%d %H:%M:%S"))
+                        if exp.next_state:
+                            st.write("**Next State:**", exp.next_state[:100] + "..." if len(exp.next_state) > 100 else exp.next_state)
+        else:
+            st.info("Experience buffer rỗng")
+    
+    # Consolidated knowledge (moved outside tabs)
     st.subheader("🧩 Consolidated Knowledge")
     
     consolidated_knowledge = agent.consolidation_system.consolidated_knowledge
@@ -526,6 +716,76 @@ def session_management():
     
     except Exception as e:
         st.error(f"Lỗi database stats: {e}")
+    
+    # Episodic Experiences
+    st.subheader("🧠 Episodic Experiences")
+    try:
+        # Get meta-learning system stats
+        meta_stats = agent.meta_learning_system.get_system_statistics()
+        experience_buffer = agent.meta_learning_system.experience_buffer
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Tổng Experiences", len(experience_buffer))
+        with col2:
+            st.metric("Memory Bank Size", meta_stats['memory_bank']['total_memories'])
+        with col3:
+            st.metric("Timestep", meta_stats['memory_bank'].get('current_timestep', 0))
+        
+        # Display recent experiences
+        if experience_buffer:
+            st.write("**Experiences gần đây:**")
+            
+            # Limit to recent 10 experiences
+            recent_experiences = experience_buffer[-10:] if len(experience_buffer) > 10 else experience_buffer
+            
+            for i, exp in enumerate(reversed(recent_experiences)):
+                with st.expander(f"Experience {i+1} - Reward: {exp.get('reward', 0):.2f}"):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.write("**Context:**")
+                        st.text_area("", exp.get('context', ''), height=100, key=f"exp_context_{i}", disabled=True)
+                        
+                        st.write("**Reward:**", exp.get('reward', 0))
+                        if exp.get('user_feedback'):
+                            st.write("**User Feedback:**", exp.get('user_feedback'))
+                    
+                    with col2:
+                        st.write("**Response:**")
+                        st.text_area("", exp.get('response', ''), height=100, key=f"exp_response_{i}", disabled=True)
+                        
+                        timestamp = exp.get('timestamp')
+                        if timestamp:
+                            if hasattr(timestamp, 'isoformat'):
+                                st.write("**Timestamp:**", timestamp.isoformat())
+                            else:
+                                st.write("**Timestamp:**", str(timestamp))
+        else:
+            st.info("Chưa có episodic experiences nào")
+        
+        # Memory Bank Information
+        st.write("**Memory Bank Details:**")
+        if meta_stats.get('memory_loaded_from_db'):
+            st.success("✅ Memory bank đã được load từ database")
+        else:
+            st.warning("⚠️ Memory bank chưa được load từ database")
+        
+        # Memory Bank entries preview
+        try:
+            memories = agent.meta_learning_system.select_relevant_memories("sample query", top_k=5)
+            if memories:
+                st.write("**Sample Memory Entries:**")
+                for i, memory in enumerate(memories):
+                    with st.expander(f"Memory {i+1} - Similarity: {memory.get('similarity', 0):.3f}"):
+                        st.write("**Memory Index:**", memory.get('memory_index', 'Unknown'))
+                        st.write("**Importance Weight:**", memory.get('importance_weight', 1.0))
+                        st.write("**Usage Count:**", memory.get('usage_count', 0))
+        except Exception as e:
+            st.warning(f"Không thể load memory entries: {e}")
+    
+    except Exception as e:
+        st.error(f"Lỗi khi load episodic experiences: {e}")
     
     # Advanced actions
     st.subheader("Hành động nâng cao")
