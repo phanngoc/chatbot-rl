@@ -1,0 +1,7 @@
+---
+description: |
+  - Không dùng hasattr(self.experience_buffer, 'buffer') 
+  - Không dùng fallback.
+globs:
+alwaysApply: true
+---

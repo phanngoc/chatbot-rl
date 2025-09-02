@@ -103,6 +103,7 @@ toml==0.10.2
 torch==2.8.0
 tornado==6.5.2
 tqdm==4.67.1
+umap-learn>=0.5.3
 transformers==4.55.2
 typer==0.16.1
 typing-inspection==0.4.1

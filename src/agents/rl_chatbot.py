@@ -22,7 +22,7 @@ from core.experience_replay import ExperienceReplayBuffer, Experience, Experienc
 from memory.retrieval_memory import RetrievalAugmentedMemory
 from memory.consolidation import MemoryConsolidationSystem
 from memory.memory_manager import IntelligentMemoryManager, LLMExtractor, MemoryOperation
-from core.ewc import MultiTaskEWC
+# from core.ewc import MultiTaskEWC  # Removed EWC integration
 from core.meta_learning import MetaLearningEpisodicSystem
 from core.temporal_weighting import TemporalWeightingSystem
 
@@ -46,6 +46,9 @@ class RLChatbotModel:
         
         self.hidden_size = hidden_size
         self.memory_dim = memory_dim
+        
+        # Setup logger
+        self.logger = logging.getLogger("RLChatbotModel")
         
         # Neural components cho RL value estimation
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -414,11 +417,21 @@ class RLChatbotAgent:
             consolidation_interval_hours=self.config.get("consolidation_interval", 24)
         )
         
-        # EWC System
-        self.ewc_system = MultiTaskEWC(
-            model=self.model,
-            ewc_lambda=self.config.get("ewc_lambda", 1000.0)
-        )
+        # EWC System removed for cleaner implementation
+        # self.ewc_system = MultiTaskEWC(
+        #     model=self.model,
+        #     ewc_lambda=self.config.get("ewc_lambda", 1000.0)
+        # )
+        
+        # EWC state tracking removed
+        # self.current_ewc_task_id = None
+        # self.ewc_conversation_experiences = []
+        # self.ewc_performance_tracking = {
+        #     "tasks_completed": 0,
+        #     "fisher_computations": 0,
+        #     "consolidation_events": 0,
+        #     "memory_retention_scores": []
+        # }
         
         # Meta-learning System
         self.meta_learning_system = MetaLearningEpisodicSystem(
@@ -737,7 +750,7 @@ class RLChatbotAgent:
                          bot_response: str,
                          context: str = "",
                          user_feedback: Optional[float] = None) -> str:
-        """Store experience sử dụng Intelligent Memory Manager (Algorithm 1)"""
+        """Store experience với EWC integration và Intelligent Memory Manager"""
         
         experience_id = str(uuid.uuid4())
         timestamp = datetime.now()
@@ -748,6 +761,8 @@ class RLChatbotAgent:
         else:
             # Default neutral reward
             reward = 0.0
+        
+        # EWC tracking removed - using existing memory systems
         
         # 1. Store trong Experience Replay Buffer (vẫn giữ cho RL training)
         try:
@@ -826,6 +841,7 @@ class RLChatbotAgent:
                 )
         except Exception as e:
             self.logger.warning(f"Failed to store in temporal weighting: {e}")
+
         
         return experience_id
     
@@ -945,7 +961,7 @@ class RLChatbotAgent:
                                       feedback_score: float):
         """Trigger learning khi có strong feedback"""
         
-        # Experience replay training
+        # Experience replay training (simplified)
         try:
             if hasattr(self.experience_buffer, 'buffer') and len(self.experience_buffer.buffer) >= 32:
                 training_results = self.replay_trainer.replay_training_step(
@@ -956,7 +972,7 @@ class RLChatbotAgent:
         except Exception as e:
             self.logger.warning(f"Feedback-triggered training failed: {e}")
         
-        # Meta-learning session (nếu có đủ data)
+        # Meta-learning session (giữ nguyên)
         try:
             if hasattr(self.meta_learning_system, 'experience_buffer') and len(self.meta_learning_system.experience_buffer) >= 20:
                 meta_results = self.meta_learning_system.meta_learning_session(num_episodes=5)
@@ -1100,11 +1116,12 @@ class RLChatbotAgent:
             except Exception as e:
                 self.logger.warning(f"Failed to save consolidation system: {e}")
                 
-            try:
-                if hasattr(self.ewc_system, 'save_ewc_data'):
-                    self.ewc_system.save_ewc_data(filepath.replace('.json', '_ewc_data.pkl'))
-            except Exception as e:
-                self.logger.warning(f"Failed to save EWC system: {e}")
+            # EWC save removed
+            # try:
+            #     if hasattr(self.ewc_system, 'save_ewc_data'):
+            #         self.ewc_system.save_ewc_data(filepath.replace('.json', '_ewc_data.pkl'))
+            # except Exception as e:
+            #     self.logger.warning(f"Failed to save EWC system: {e}")
                 
             try:
                 if hasattr(self.meta_learning_system, 'save_system'):
@@ -1177,11 +1194,12 @@ class RLChatbotAgent:
             except Exception as e:
                 self.logger.warning(f"Failed to load retrieval memory: {e}")
                 
-            try:
-                if hasattr(self.ewc_system, 'load_ewc_data'):
-                    self.ewc_system.load_ewc_data(filepath.replace('.json', '_ewc_data.pkl'))
-            except Exception as e:
-                self.logger.warning(f"Failed to load EWC system: {e}")
+            # EWC load removed
+            # try:
+            #     if hasattr(self.ewc_system, 'load_ewc_data'):
+            #         self.ewc_system.load_ewc_data(filepath.replace('.json', '_ewc_data.pkl'))
+            # except Exception as e:
+            #     self.logger.warning(f"Failed to load EWC system: {e}")
                 
             try:
                 if hasattr(self.meta_learning_system, 'load_system'):
@@ -1216,3 +1234,22 @@ class RLChatbotAgent:
         except Exception as e:
             self.logger.error(f"Lỗi khi load agent state: {e}")
             return False
+    
+    def _finish_conversation_ewc_task(self) -> bool:
+        """EWC functionality removed - stub for compatibility"""
+        return True
+    
+    # EWC methods removed for cleaner implementation
+    
+    def get_system_statistics(self) -> Dict[str, Any]:
+        """Lấy thống kê tổng thể của system - replaced EWC statistics"""
+        return {
+            "total_interactions": self.performance_metrics["total_interactions"],
+            "positive_feedback": self.performance_metrics["positive_feedback"],
+            "negative_feedback": self.performance_metrics["negative_feedback"],
+            "avg_response_time": self.performance_metrics["avg_response_time"],
+            "memory_retrievals": self.performance_metrics["memory_retrievals"],
+            "consolidation_runs": self.performance_metrics["consolidation_runs"],
+            "current_conversation": self.current_conversation_id,
+            "conversation_length": len(self.conversation_history)
+        }

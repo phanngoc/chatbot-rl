@@ -1,0 +1,30 @@
+# Visualization Requirements cho Memory Visualizer App
+
+# Core Streamlit
+streamlit>=1.28.0
+
+# Data manipulation và analysis 
+pandas>=1.5.0
+numpy>=1.21.0
+
+# Visualization
+plotly>=5.15.0
+matplotlib>=3.6.0
+seaborn>=0.11.0
+
+# Machine Learning và Dimensionality Reduction
+scikit-learn>=1.2.0
+umap-learn>=0.5.3
+
+# Graph processing
+networkx>=2.8.0
+
+# Memory và AI dependencies (nếu chưa có)
+sentence-transformers>=2.2.0
+chromadb>=0.4.0
+faiss-cpu>=1.7.0
+openai>=1.0.0
+
+# Utilities
+tiktoken>=0.4.0
+torch>=2.0.0
