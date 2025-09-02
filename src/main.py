@@ -141,9 +141,19 @@ def batch_training_mode(agent: RLChatbotAgent, training_data_path: str):
             similarity = len(set(result['response'].lower().split()) & 
                            set(expected_response.lower().split())) / \
                         len(set(expected_response.lower().split()))
-            feedback_score = (similarity - 0.5) * 2  # Convert to [-1, 1]
+            
+            # Convert similarity to 1-5 star rating, then to [-1, 1] scale
+            star_rating = max(1, min(5, int(similarity * 5) + 1))  # 1-5 stars
+            feedback_score = (star_rating - 3) / 2.0  # Convert to [-1, 1] scale
         else:
-            feedback_score = reward
+            # If reward is provided, convert it to 1-5 scale then to [-1, 1]
+            if reward is not None:
+                # Assume reward is already in [-1, 1] scale
+                star_rating = int((reward + 1) * 2.5 + 1)  # Convert to 1-5
+                star_rating = max(1, min(5, star_rating))  # Clamp to 1-5
+                feedback_score = (star_rating - 3) / 2.0  # Back to [-1, 1]
+            else:
+                feedback_score = 0.0  # Neutral if no reward provided
         
         agent.provide_feedback(result['experience_id'], feedback_score)
         

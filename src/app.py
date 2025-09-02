@@ -115,18 +115,20 @@ def chat_interface():
                         with col2:
                             st.metric("Response Time", f"{metadata['response_time_ms']:.1f}ms")
                         with col3:
-                            # Feedback buttons
+                            # Rating system 1-5 stars
                             feedback_key = f"feedback_{metadata['experience_id']}"
+                            st.write("**Đánh giá phản hồi:**")
                             
-                            col_pos, col_neg = st.columns(2)
-                            with col_pos:
-                                if st.button("👍", key=f"{feedback_key}_pos"):
-                                    agent.provide_feedback(metadata['experience_id'], 0.8)
-                                    st.success("Cảm ơn feedback tích cực!")
-                            with col_neg:
-                                if st.button("👎", key=f"{feedback_key}_neg"):
-                                    agent.provide_feedback(metadata['experience_id'], -0.8)
-                                    st.success("Cảm ơn feedback, tôi sẽ cải thiện!")
+                            # Create 5 star rating buttons
+                            rating_cols = st.columns(5)
+                            for i in range(1, 6):
+                                with rating_cols[i-1]:
+                                    if st.button(f"⭐{i}", key=f"{feedback_key}_star_{i}"):
+                                        # Convert 1-5 scale to [-1, 1] scale for internal use
+                                        # 1→-1, 2→-0.5, 3→0, 4→0.5, 5→1
+                                        feedback_score = (i - 3) / 2.0
+                                        agent.provide_feedback(metadata['experience_id'], feedback_score)
+                                        st.success(f"Cảm ơn bạn đã đánh giá {i}/5 sao!")
     
     # Sidebar controls
     with st.sidebar:

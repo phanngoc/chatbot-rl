@@ -79,6 +79,21 @@ python src/main.py --mode eval --data examples/sample_training_data.json
 - Importance weighting dựa trên feedback và usage
 - Access pattern analysis
 
+## 🌟 Hệ thống Feedback
+
+Chatbot sử dụng hệ thống đánh giá **1-5 sao** cho mỗi phản hồi:
+
+- **⭐1**: Rất kém (feedback score: -1.0)
+- **⭐2**: Kém (feedback score: -0.5)
+- **⭐3**: Trung bình (feedback score: 0.0)
+- **⭐4**: Tốt (feedback score: 0.5)
+- **⭐5**: Rất tốt (feedback score: 1.0)
+
+### Cách sử dụng:
+- **Web Interface**: Nhấn vào các nút ⭐1-5 sau mỗi phản hồi
+- **Terminal**: Nhập số từ 1-5 khi được hỏi feedback
+- **Batch Training**: Score tự động dựa trên similarity với expected response
+
 MIT License - xem file LICENSE để biết chi tiết.
 
 ## 🙏 Acknowledgments
