@@ -2,7 +2,7 @@
 
 ## Tổng Quan
 
-Hệ thống meta-learning này được thiết kế để học cách học từ kinh nghiệm trước đó thông qua episodic memory. Hệ thống kết hợp Neural Turing Machine (NTM), Memory-Augmented Neural Network (MANN), và meta-learning để tạo ra một chatbot có khả năng thích ứng nhanh chóng.
+Hệ thống meta-learning này được thiết kế để học cách học từ kinh nghiệm trước đó thông qua episodic memory. Hệ thống kết hợp Memory-Augmented Neural Network (MANN), và meta-learning để tạo ra một chatbot có khả năng thích ứng nhanh chóng.
 
 ## 1. Neural Turing Machine (NTM)
 

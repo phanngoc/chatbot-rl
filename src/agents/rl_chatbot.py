@@ -421,22 +421,6 @@ class RLChatbotAgent:
             consolidation_interval_hours=self.config.get("consolidation_interval", 24)
         )
         
-        # EWC System removed for cleaner implementation
-        # self.ewc_system = MultiTaskEWC(
-        #     model=self.model,
-        #     ewc_lambda=self.config.get("ewc_lambda", 1000.0)
-        # )
-        
-        # EWC state tracking removed
-        # self.current_ewc_task_id = None
-        # self.ewc_conversation_experiences = []
-        # self.ewc_performance_tracking = {
-        #     "tasks_completed": 0,
-        #     "fisher_computations": 0,
-        #     "consolidation_events": 0,
-        #     "memory_retention_scores": []
-        # }
-        
         # Meta-learning System với session support
         self.meta_learning_system = MetaLearningEpisodicSystem(
             input_size=768,
@@ -466,7 +450,9 @@ class RLChatbotAgent:
             similarity_threshold_update=self.config.get("similarity_threshold_update", 0.8),
             similarity_threshold_delete=self.config.get("similarity_threshold_delete", 0.95),
             importance_threshold=self.config.get("importance_threshold", 0.3),
-            max_memory_capacity=self.config.get("max_memory_capacity", 5000)
+            max_memory_capacity=self.config.get("max_memory_capacity", 5000),
+            knowledge_db_path=self.config.get("knowledge_db_path", "data/knowledge_bank.db"),
+            enable_knowledge_db=self.config.get("enable_knowledge_db", True)
         )
         
         # Experience Replay Trainer
@@ -897,7 +883,9 @@ class RLChatbotAgent:
             # Use Memory Manager để quyết định memory operation
             memory_result = self.memory_manager.construct_memory_bank(
                 dialogue_turns=[dialogue_turn],
-                context=full_context
+                context=full_context,
+                session_id=self.current_session_id,
+                conversation_id=self.current_conversation_id
             )
             
             self.logger.info(f"Memory Manager result: {memory_result.get('memories_added', 0)} added, "
@@ -1139,13 +1127,14 @@ class RLChatbotAgent:
         """Lấy insights chi tiết từ Memory Manager"""
         
         try:
-            return {
+            insights = {
                 "operation_statistics": self.memory_manager.get_operation_statistics(),
                 "configuration": {
                     "similarity_threshold_update": self.memory_manager.similarity_threshold_update,
                     "similarity_threshold_delete": self.memory_manager.similarity_threshold_delete,
                     "importance_threshold": self.memory_manager.importance_threshold,
-                    "max_memory_capacity": self.memory_manager.max_memory_capacity
+                    "max_memory_capacity": self.memory_manager.max_memory_capacity,
+                    "knowledge_database_enabled": self.memory_manager.enable_knowledge_db
                 },
                 "memory_bank_status": {
                     "total_memories": len(self.memory_manager.memory_system.store.memories) if hasattr(self.memory_manager.memory_system, 'store') and hasattr(self.memory_manager.memory_system.store, 'memories') else 0,
@@ -1153,6 +1142,11 @@ class RLChatbotAgent:
                 },
                 "llm_extractor_model": self.memory_manager.llm_extractor.model_name
             }
+            
+            knowledge_insights = self.memory_manager.get_knowledge_insights(self.current_session_id)
+            insights["knowledge_database"] = knowledge_insights
+            
+            return insights
         except Exception as e:
             self.logger.error(f"Failed to get memory manager insights: {e}")
             return {"error": str(e)}
@@ -1442,6 +1436,14 @@ class RLChatbotAgent:
             except Exception as e:
                 self.logger.error(f"Failed to cleanup old data: {e}")
         
+        # Cleanup Knowledge Database if available
+        if self.memory_manager.enable_knowledge_db and self.memory_manager.knowledge_db:
+            try:
+                knowledge_cleanup = self.memory_manager.knowledge_db.cleanup_old_data(days_threshold)
+                results.update(knowledge_cleanup)
+            except Exception as e:
+                self.logger.error(f"Failed to cleanup knowledge database: {e}")
+        
         return results
     
     def _finish_conversation_ewc_task(self) -> bool:
@@ -1462,3 +1464,82 @@ class RLChatbotAgent:
             "current_conversation": self.current_conversation_id,
             "conversation_length": len(self.conversation_history)
         }
+    
+    # === Knowledge Database Methods ===
+    
+    def search_knowledge(self, 
+                        query: str, 
+                        memory_type: str = None,
+                        min_importance: float = 0.0,
+                        session_only: bool = True) -> List[Dict[str, Any]]:
+        """Search knowledge trong Knowledge Database"""
+        
+        session_id = self.current_session_id if session_only else None
+        
+        try:
+            return self.memory_manager.search_knowledge_bank(
+                query=query,
+                session_id=session_id,
+                memory_type=memory_type,
+                min_importance=min_importance
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to search knowledge: {e}")
+            return []
+    
+    def get_knowledge_by_session(self, session_id: str = None, limit: int = 20) -> List[Dict[str, Any]]:
+        """Lấy knowledge theo session"""
+        
+        target_session = session_id or self.current_session_id
+        if not target_session:
+            return []
+        
+        try:
+            if self.memory_manager.enable_knowledge_db and self.memory_manager.knowledge_db:
+                return self.memory_manager.knowledge_db.get_knowledge_by_session(target_session, limit)
+        except Exception as e:
+            self.logger.error(f"Failed to get knowledge by session: {e}")
+        
+        return []
+    
+    def export_session_knowledge(self, output_path: str, session_id: str = None) -> bool:
+        """Export knowledge của session ra file"""
+        
+        target_session = session_id or self.current_session_id
+        if not target_session:
+            self.logger.error("No session specified for knowledge export")
+            return False
+        
+        try:
+            if self.memory_manager.enable_knowledge_db and self.memory_manager.knowledge_db:
+                self.memory_manager.knowledge_db.export_knowledge_data(output_path, target_session)
+                self.logger.info(f"Exported session knowledge to: {output_path}")
+                return True
+        except Exception as e:
+            self.logger.error(f"Failed to export session knowledge: {e}")
+        
+        return False
+    
+    def get_knowledge_statistics(self, days_back: int = 7) -> Dict[str, Any]:
+        """Lấy thống kê từ Knowledge Database"""
+        
+        try:
+            if self.memory_manager.enable_knowledge_db and self.memory_manager.knowledge_db:
+                return self.memory_manager.knowledge_db.get_knowledge_statistics(days_back)
+        except Exception as e:
+            self.logger.error(f"Failed to get knowledge statistics: {e}")
+        
+        return {"error": "Knowledge Database not available"}
+    
+    def update_knowledge_daily_stats(self) -> bool:
+        """Cập nhật thống kê knowledge hàng ngày"""
+        
+        try:
+            if self.memory_manager.enable_knowledge_db and self.memory_manager.knowledge_db:
+                self.memory_manager.knowledge_db.update_daily_statistics()
+                self.logger.info("Updated daily knowledge statistics")
+                return True
+        except Exception as e:
+            self.logger.error(f"Failed to update daily statistics: {e}")
+        
+        return False

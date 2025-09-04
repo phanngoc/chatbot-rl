@@ -16,13 +16,13 @@ import os
 
 from .retrieval_memory import EpisodicMemory, RetrievalAugmentedMemory
 
+from .memory_operations import MemoryOperation
 
-class MemoryOperation(Enum):
-    """Các operations cho memory management"""
-    ADD = "ADD"
-    UPDATE = "UPDATE" 
-    DELETE = "DELETE"
-    NOOP = "NOOP"
+# Import KnowledgeDB
+try:
+    from ..database.knowledge_db_manager import KnowledgeDatabaseManager
+except ImportError:
+    KnowledgeDatabaseManager = None
 
 
 @dataclass
@@ -181,7 +181,9 @@ class IntelligentMemoryManager:
                  similarity_threshold_update: float = 0.8,
                  similarity_threshold_delete: float = 0.95,
                  importance_threshold: float = 0.3,
-                 max_memory_capacity: int = 5000):
+                 max_memory_capacity: int = 5000,
+                 knowledge_db_path: str = "data/knowledge_bank.db",
+                 enable_knowledge_db: bool = True):
         
         self.memory_system = memory_system
         self.llm_extractor = llm_extractor
@@ -191,6 +193,18 @@ class IntelligentMemoryManager:
         self.max_memory_capacity = max_memory_capacity
         
         self.logger = logging.getLogger("MemoryManager")
+        
+        # Knowledge Database Integration
+        self.enable_knowledge_db = enable_knowledge_db and KnowledgeDatabaseManager is not None
+        self.knowledge_db = None
+        
+        if self.enable_knowledge_db:
+            try:
+                self.knowledge_db = KnowledgeDatabaseManager(knowledge_db_path)
+                self.logger.info("Knowledge Database integrated successfully")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize Knowledge Database: {e}")
+                self.enable_knowledge_db = False
         
         # Statistics
         self.operation_stats = {
@@ -202,7 +216,9 @@ class IntelligentMemoryManager:
     
     def construct_memory_bank(self, 
                             dialogue_turns: List[str],
-                            context: str = "") -> Dict[str, Any]:
+                            context: str = "",
+                            session_id: str = None,
+                            conversation_id: str = None) -> Dict[str, Any]:
         """
         Implementation của Algorithm 1: Memory Bank Construction via Memory Manager
         
@@ -231,16 +247,46 @@ class IntelligentMemoryManager:
                 # Step 1: Extract key info using LLM
                 extracted_info = self.llm_extractor.extract_key_info(dialogue_turn, context)
                 
+                # Step 1.5: Store extracted knowledge to Knowledge Database (if enabled)
+                knowledge_id = None
+                if self.enable_knowledge_db and self.knowledge_db:
+                    try:
+                        knowledge_id = self.knowledge_db.store_extracted_knowledge(
+                            extracted_info=extracted_info,
+                            dialogue_turn=dialogue_turn,
+                            context=context,
+                            conversation_id=conversation_id or "unknown",
+                            session_id=session_id or "unknown"
+                        )
+                        self.logger.debug(f"Stored extracted knowledge: {knowledge_id}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to store extracted knowledge: {e}")
+                
                 # Skip if not worth remembering
                 if not extracted_info.get("requires_memory", True) or extracted_info.get("importance", 0) < self.importance_threshold:
                     operation_result = {
                         "turn_index": i,
                         "operation": MemoryOperation.NOOP,
                         "reasoning": "Below importance threshold or doesn't require memory",
-                        "extracted_info": extracted_info
+                        "extracted_info": extracted_info,
+                        "knowledge_id": knowledge_id
                     }
                     results["operations_performed"].append(operation_result)
                     results["noop_operations"] += 1
+                    
+                    # Store NOOP operation to Knowledge Database
+                    if self.enable_knowledge_db and self.knowledge_db and knowledge_id:
+                        try:
+                            self.knowledge_db.store_memory_operation(
+                                operation_type=MemoryOperation.NOOP,
+                                knowledge_id=knowledge_id,
+                                confidence=0.9,
+                                reasoning="Below importance threshold or doesn't require memory",
+                                execution_result={"success": True, "message": "No operation needed"}
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"Failed to store NOOP operation: {e}")
+                    
                     continue
                 
                 # Step 2: Retrieve relevant memories using RAG
@@ -261,6 +307,20 @@ class IntelligentMemoryManager:
                     operation_decision, extracted_info, dialogue_turn, context
                 )
                 
+                # Store memory operation to Knowledge Database
+                if self.enable_knowledge_db and self.knowledge_db and knowledge_id:
+                    try:
+                        self.knowledge_db.store_memory_operation(
+                            operation_type=operation_decision.operation,
+                            knowledge_id=knowledge_id,
+                            confidence=operation_decision.confidence,
+                            reasoning=operation_decision.reasoning,
+                            execution_result=execution_result,
+                            target_memory_id=operation_decision.target_memory_id
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Failed to store memory operation: {e}")
+                
                 # Record results
                 operation_result = {
                     "turn_index": i,
@@ -269,7 +329,8 @@ class IntelligentMemoryManager:
                     "reasoning": operation_decision.reasoning,
                     "target_memory_id": operation_decision.target_memory_id,
                     "extracted_info": extracted_info,
-                    "execution_result": execution_result
+                    "execution_result": execution_result,
+                    "knowledge_id": knowledge_id
                 }
                 
                 results["operations_performed"].append(operation_result)
@@ -718,7 +779,7 @@ class IntelligentMemoryManager:
         
         total_ops = sum(self.operation_stats.values())
         
-        return {
+        stats = {
             "total_operations": total_ops,
             "operation_counts": self.operation_stats.copy(),
             "operation_percentages": {
@@ -730,5 +791,90 @@ class IntelligentMemoryManager:
                 "update_ratio": self.operation_stats["UPDATE"] / total_ops if total_ops > 0 else 0,
                 "noop_ratio": self.operation_stats["NOOP"] / total_ops if total_ops > 0 else 0,
                 "memory_bank_size": len(self.memory_system.store.memories) if hasattr(self.memory_system, 'store') and hasattr(self.memory_system.store, 'memories') else 0
-            }
+            },
+            "knowledge_database_enabled": self.enable_knowledge_db
         }
+        
+        # Add Knowledge Database statistics if available
+        if self.enable_knowledge_db and self.knowledge_db:
+            try:
+                knowledge_stats = self.knowledge_db.get_knowledge_statistics()
+                stats["knowledge_database_stats"] = knowledge_stats
+            except Exception as e:
+                self.logger.warning(f"Failed to get knowledge database stats: {e}")
+                stats["knowledge_database_stats"] = {"error": str(e)}
+        
+        return stats
+    
+    def get_knowledge_insights(self, session_id: str = None) -> Dict[str, Any]:
+        """Lấy insights từ Knowledge Database"""
+        
+        if not self.enable_knowledge_db or not self.knowledge_db:
+            return {"error": "Knowledge Database not available"}
+        
+        try:
+            insights = {
+                "database_statistics": self.knowledge_db.get_knowledge_statistics(),
+                "recent_knowledge": []
+            }
+            
+            # Get recent knowledge for session
+            if session_id:
+                recent_knowledge = self.knowledge_db.get_knowledge_by_session(session_id, limit=10)
+                insights["recent_knowledge"] = recent_knowledge
+                insights["session_summary"] = {
+                    "total_entries": len(recent_knowledge),
+                    "avg_importance": sum(k.get("importance", 0) for k in recent_knowledge) / max(len(recent_knowledge), 1),
+                    "common_topics": self._extract_common_topics(recent_knowledge),
+                    "memory_types": self._extract_memory_types(recent_knowledge)
+                }
+            
+            return insights
+        
+        except Exception as e:
+            self.logger.error(f"Failed to get knowledge insights: {e}")
+            return {"error": str(e)}
+    
+    def _extract_common_topics(self, knowledge_entries: List[Dict]) -> List[str]:
+        """Extract common topics từ knowledge entries"""
+        
+        topic_counts = {}
+        for entry in knowledge_entries:
+            topics = entry.get("topics", [])
+            for topic in topics:
+                topic_counts[topic] = topic_counts.get(topic, 0) + 1
+        
+        # Sort by frequency
+        sorted_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)
+        return [topic for topic, count in sorted_topics[:5]]
+    
+    def _extract_memory_types(self, knowledge_entries: List[Dict]) -> Dict[str, int]:
+        """Extract memory types distribution"""
+        
+        type_counts = {}
+        for entry in knowledge_entries:
+            memory_type = entry.get("memory_type", "other")
+            type_counts[memory_type] = type_counts.get(memory_type, 0) + 1
+        
+        return type_counts
+    
+    def search_knowledge_bank(self, 
+                             query: str, 
+                             session_id: str = None,
+                             memory_type: str = None,
+                             min_importance: float = 0.0) -> List[Dict[str, Any]]:
+        """Search trong Knowledge Database"""
+        
+        if not self.enable_knowledge_db or not self.knowledge_db:
+            return []
+        
+        try:
+            return self.knowledge_db.search_knowledge(
+                query=query,
+                session_id=session_id,
+                memory_type=memory_type,
+                min_importance=min_importance
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to search knowledge bank: {e}")
+            return []
