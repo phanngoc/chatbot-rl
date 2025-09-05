@@ -3,7 +3,7 @@ description: |
   - Không dùng hasattr để check tồn tại của attribute
   - Không dùng fallback.
   - Tài liệu markdown, nếu có math block thì dùng cú pháp latex.
-  - Đối với mermaid code : không dùng 2 dấu '(' ')' mà dùng 2 dấu '<' '>'
+  - Đối với mermaid code : không dùng 2 dấu ( ) mà dùng 2 dấu < >
 globs:
 alwaysApply: true
 ---

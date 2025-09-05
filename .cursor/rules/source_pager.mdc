@@ -1,7 +1,7 @@
 ---
 description:
-    - Memory Augmented Neural Network Adaptive Controllers
-    - 
+    - Memory Augmented Neural Network
+    - Các tính năng cli, sau khi tạo file demo.py , agent có thể dùng file này để demo các tính năng và fix các lỗi nhanh chóng.
 globs:
 alwaysApply: true
 ---
