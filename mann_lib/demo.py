@@ -58,6 +58,11 @@ async def demo_basic_conversation():
         print(f"  Total queries: {stats.get('total_queries', 0)}")
         print(f"  Memories created: {stats.get('total_memories_created', 0)}")
         print(f"  Memory utilization: {stats.get('memory_utilization', 0):.2%}")
+        print(f"  Total retrievals: {stats.get('total_retrievals', 0)}")
+        print(f"  Total writes: {stats.get('total_writes', 0)}")
+        print(f"  Memory matrix norm: {stats.get('memory_matrix_norm', 0):.4f}")
+        print(f"  Ŵ norm: {stats.get('W_hat_norm', 0):.4f}")
+        print(f"  V̂ norm: {stats.get('V_hat_norm', 0):.4f}")
         
     finally:
         await chatbot.shutdown()
@@ -200,6 +205,81 @@ async def demo_health_monitoring():
         await chatbot.shutdown()
 
 
+async def demo_external_working_memory():
+    """Demo External Working Memory features"""
+    print("\n🧠 Demo: External Working Memory")
+    print("=" * 50)
+    
+    config = MANNConfig()
+    chatbot = MANNChatbot(config)
+    
+    try:
+        await chatbot.initialize()
+        
+        print("🔬 Testing External Working Memory Operations...")
+        
+        # Test sequences to demonstrate learning
+        test_sequences = [
+            "Tôi tên là Ngọc và thích lập trình",
+            "Tôi đang học về AI và Machine Learning", 
+            "Tôi sống ở Hà Nội và làm việc tại ABC",
+            "Tôi có sở thích đọc sách và chơi game",
+            "Tôi muốn trở thành AI Engineer"
+        ]
+        
+        print("\n📝 Processing test sequences...")
+        for i, sequence in enumerate(test_sequences, 1):
+            print(f"\n👤 Input {i}: {sequence}")
+            
+            start_time = time.time()
+            response = await chatbot.process_user_input(sequence)
+            processing_time = time.time() - start_time
+            
+            print(f"🤖 Response: {response}")
+            print(f"⏱️  Processing time: {processing_time:.3f}s")
+            
+            # Show memory statistics after each input
+            stats = await chatbot.get_memory_statistics()
+            print(f"📊 Memory stats: retrievals={stats.get('total_retrievals', 0)}, writes={stats.get('total_writes', 0)}")
+            
+            await asyncio.sleep(0.5)
+        
+        # Test memory search
+        print("\n🔍 Testing Memory Search...")
+        search_queries = ["tên", "lập trình", "AI", "Hà Nội", "sở thích"]
+        
+        for query in search_queries:
+            print(f"\n🔍 Searching for: '{query}'")
+            results = await chatbot.search_memories(query, top_k=2)
+            
+            if results:
+                print(f"  Found {len(results)} relevant memories:")
+                for j, result in enumerate(results, 1):
+                    print(f"    {j}. {result['content'][:60]}...")
+                    print(f"       Similarity: {result.get('similarity', 0):.3f}")
+            else:
+                print("  No relevant memories found.")
+        
+        # Show final statistics
+        final_stats = await chatbot.get_memory_statistics()
+        print(f"\n📊 Final External Working Memory Statistics:")
+        print(f"  Total queries: {final_stats.get('total_queries', 0)}")
+        print(f"  Total retrievals: {final_stats.get('total_retrievals', 0)}")
+        print(f"  Total writes: {final_stats.get('total_writes', 0)}")
+        print(f"  Memory matrix norm: {final_stats.get('memory_matrix_norm', 0):.4f}")
+        print(f"  Ŵ matrix norm: {final_stats.get('W_hat_norm', 0):.4f}")
+        print(f"  V̂ matrix norm: {final_stats.get('V_hat_norm', 0):.4f}")
+        print(f"  Memory utilization: {final_stats.get('memory_utilization', 0):.2%}")
+        
+        print(f"\n✅ External Working Memory Demo Complete!")
+        print(f"   - Memory Write: μ̇ᵢ = -zᵢμᵢ + cwzᵢa + zᵢŴqμᵀ")
+        print(f"   - Memory Read: Mr = μz, z = softmax(μᵀq)")
+        print(f"   - NN Output: uad = -Ŵᵀ(σ(V̂ᵀx̃ + b̂v) + Mr) - b̂w")
+        
+    finally:
+        await chatbot.shutdown()
+
+
 async def demo_api_integration():
     """Demo API integration"""
     print("\n🌐 Demo: API Integration")
@@ -251,6 +331,7 @@ async def main():
     
     demos = [
         ("Basic Conversation", demo_basic_conversation),
+        ("External Working Memory", demo_external_working_memory),
         ("Memory Search", demo_memory_search),
         ("Memory Management", demo_memory_management),
         ("Health Monitoring", demo_health_monitoring),
@@ -271,6 +352,7 @@ async def main():
     print("\n🎉 All demos completed!")
     print("\n💡 To run individual demos:")
     print("  python demo.py --demo basic")
+    print("  python demo.py --demo external")
     print("  python demo.py --demo search")
     print("  python demo.py --demo memory")
     print("  python demo.py --demo health")
@@ -281,7 +363,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="MANN CLI Chatbot Demo")
-    parser.add_argument("--demo", choices=["basic", "search", "memory", "health", "api"], 
+    parser.add_argument("--demo", choices=["basic", "external", "search", "memory", "health", "api"], 
                        help="Run specific demo")
     
     args = parser.parse_args()
@@ -289,6 +371,7 @@ if __name__ == "__main__":
     if args.demo:
         demo_map = {
             "basic": demo_basic_conversation,
+            "external": demo_external_working_memory,
             "search": demo_memory_search,
             "memory": demo_memory_management,
             "health": demo_health_monitoring,

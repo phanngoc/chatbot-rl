@@ -192,8 +192,8 @@ class MemoryInterface(nn.Module):
 
 class MemoryAugmentedNetwork(nn.Module):
     """
-    Memory-Augmented Neural Network (MANN)
-    Sử dụng external memory để store và retrieve experiences
+    Memory-Augmented Neural Network (MANN) với External Working Memory
+    Implement đúng theo paper: Memory Write, Memory Read, và NN Output
     """
     
     def __init__(self,
@@ -212,18 +212,24 @@ class MemoryAugmentedNetwork(nn.Module):
         self.output_size = output_size
         self.device = device or torch.device('cpu')
         
-        # Controller network - use simple linear layers instead of LSTM for now
-        self.controller = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size)
-        )
+        # Controller network - LSTM for proper state management
+        self.controller = nn.LSTM(input_size, hidden_size, batch_first=True)
         
-        # Memory interface
+        # External Working Memory matrices theo paper
+        # Ŵ ∈ R^(N×m), V̂ ∈ R^(n×N), b̂v ∈ R^N, b̂w ∈ R^m
+        self.W_hat = nn.Parameter(torch.randn(hidden_size, output_size) * 0.1)
+        self.V_hat = nn.Parameter(torch.randn(input_size, hidden_size) * 0.1)
+        self.b_v = nn.Parameter(torch.zeros(hidden_size))
+        self.b_w = nn.Parameter(torch.zeros(output_size))
+        
+        # Memory interface với proper query generation
         self.memory_interface = MemoryInterface(hidden_size, memory_dim)
         
-        # Output layer
-        self.output_layer = nn.Linear(hidden_size + memory_dim, output_size)
+        # Memory matrix μ ∈ R^(memory_dim × memory_size)
+        self.memory_matrix = nn.Parameter(torch.randn(memory_dim, memory_size) * 0.1)
+        
+        # Learning rate cho memory update
+        self.memory_lr = 0.01
         
         # Initialize memory bank
         self.memory_bank: List[MemoryBankEntry] = []
@@ -249,11 +255,122 @@ class MemoryAugmentedNetwork(nn.Module):
             entry.key = entry.key.to(device)
             entry.value = entry.value.to(device)
         
+        # Move memory matrix to device
+        self.memory_matrix = self.memory_matrix.to(device)
+        
         return self
+    
+    def memory_write(self, z: torch.Tensor, a: torch.Tensor, q_mu: torch.Tensor, cw: float = 1.0) -> None:
+        """
+        Memory Write: μ̇ᵢ = -zᵢμᵢ + cwzᵢa + zᵢŴqμᵀ
+        
+        Args:
+            z: Attention weights [memory_size]
+            a: Write vector [memory_dim]
+            q_mu: Controller dependent term [memory_dim]
+            cw: Constant weight
+        """
+        # Update memory matrix using differential equation
+        for i in range(min(len(z), self.memory_size)):
+            z_i = z[i]
+            if z_i > 0:  # Only update if attention weight > 0
+                # μ̇ᵢ = -zᵢμᵢ + cwzᵢa + zᵢŴqμᵀ
+                mu_i = self.memory_matrix[:, i]
+                
+                # Ŵqμᵀ: Ŵ shape [hidden_size, output_size], q_mu shape [memory_dim]
+                # We need to project q_mu to hidden_size first
+                if q_mu.size(0) != self.hidden_size:
+                    # Use a simple projection or padding
+                    if q_mu.size(0) < self.hidden_size:
+                        q_mu_padded = torch.cat([q_mu, torch.zeros(self.hidden_size - q_mu.size(0), device=q_mu.device)])
+                    else:
+                        q_mu_padded = q_mu[:self.hidden_size]
+                else:
+                    q_mu_padded = q_mu
+                
+                # Ŵqμᵀ: [hidden_size, output_size] @ [hidden_size] -> [output_size]
+                wq_term = self.W_hat.t() @ q_mu_padded  # [output_size]
+                
+                # Project back to memory_dim if needed
+                if wq_term.size(0) != self.memory_dim:
+                    if wq_term.size(0) < self.memory_dim:
+                        wq_term = torch.cat([wq_term, torch.zeros(self.memory_dim - wq_term.size(0), device=wq_term.device)])
+                    else:
+                        wq_term = wq_term[:self.memory_dim]
+                
+                update = -z_i * mu_i + cw * z_i * a + z_i * wq_term
+                
+                # Update memory matrix (avoid in-place operation)
+                new_mu_i = mu_i + self.memory_lr * update
+                self.memory_matrix.data[:, i] = new_mu_i
+        
+        self.stats["total_writes"] += 1
+    
+    def memory_read(self, query: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Memory Read: Mr = μz, z = softmax(μᵀq)
+        
+        Args:
+            query: Query vector [memory_dim]
+            
+        Returns:
+            Mr: Retrieved memory [memory_dim]
+            z: Attention weights [memory_size]
+        """
+        # z = softmax(μᵀq)
+        # μᵀ shape: [memory_size, memory_dim], query shape: [memory_dim]
+        # Result: [memory_size]
+        z = F.softmax(torch.mv(self.memory_matrix.t(), query), dim=0)
+        
+        # Mr = μz
+        # μ shape: [memory_dim, memory_size], z shape: [memory_size]
+        # Result: [memory_dim]
+        Mr = torch.mv(self.memory_matrix, z)
+        
+        self.stats["total_retrievals"] += 1
+        return Mr, z
+    
+    def nn_output(self, x_tilde: torch.Tensor, Mr: torch.Tensor) -> torch.Tensor:
+        """
+        NN Output: uad = -Ŵᵀ(σ(V̂ᵀx̃ + b̂v) + Mr) - b̂w
+        
+        Args:
+            x_tilde: Input vector [input_size]
+            Mr: Retrieved memory [memory_dim]
+            
+        Returns:
+            uad: Neural network output [output_size]
+        """
+        # σ(V̂ᵀx̃ + b̂v)
+        # V̂ᵀ shape: [hidden_size, input_size], x̃ shape: [input_size]
+        # Result: [hidden_size]
+        hidden = torch.sigmoid(torch.mv(self.V_hat.t(), x_tilde) + self.b_v)
+        
+        # Add memory contribution (broadcast if needed)
+        if Mr.dim() == 1 and hidden.dim() == 1:
+            # Pad Mr to match hidden_size if needed
+            if Mr.size(0) != hidden.size(0):
+                if Mr.size(0) < hidden.size(0):
+                    padding = torch.zeros(hidden.size(0) - Mr.size(0), device=Mr.device)
+                    Mr_padded = torch.cat([Mr, padding])
+                else:
+                    Mr_padded = Mr[:hidden.size(0)]
+            else:
+                Mr_padded = Mr
+            combined = hidden + Mr_padded
+        else:
+            combined = hidden + Mr
+        
+        # uad = -Ŵᵀ(combined) - b̂w
+        # Ŵᵀ shape: [output_size, hidden_size], combined shape: [hidden_size]
+        # Result: [output_size]
+        uad = -torch.mv(self.W_hat.t(), combined) - self.b_w
+        
+        return uad
     
     def forward(self, x: torch.Tensor, retrieve_memories: bool = True) -> Tuple[torch.Tensor, List[Dict]]:
         """
-        Forward pass
+        Forward pass với External Working Memory
         
         Args:
             x: Input tensor [batch_size, seq_len, input_size]
@@ -263,57 +380,52 @@ class MemoryAugmentedNetwork(nn.Module):
             output: Model output
             memory_info: Information about retrieved memories
         """
-        # Controller forward pass
-        # x shape: [batch_size, seq_len, input_size]
         batch_size, seq_len, input_size = x.shape
         
-        # Reshape to [batch_size * seq_len, input_size] for linear layers
-        x_reshaped = x.view(-1, input_size)
-        
-        # Process through controller
-        controller_output = self.controller(x_reshaped)
-        
-        # Reshape back to [batch_size, seq_len, hidden_size]
-        controller_output = controller_output.view(batch_size, seq_len, -1)
+        # Controller forward pass với LSTM
+        controller_output, (hidden_state, cell_state) = self.controller(x)
         
         # Use last output as hidden state
         last_hidden = controller_output[:, -1, :]  # [batch_size, hidden_size]
         
-        if retrieve_memories and self.memory_bank:
-            # Generate query
-            query = self.memory_interface.generate_query(last_hidden)
+        # Generate query từ hidden state
+        query = self.memory_interface.generate_query(last_hidden.squeeze(0))
+        
+        if retrieve_memories:
+            # Memory Read: Mr = μz, z = softmax(μᵀq)
+            Mr, z = self.memory_read(query)
             
-            # Retrieve memories
-            retrieved_memory, memory_info = self.memory_interface.retrieve(
-                query, self.memory_bank, top_k=3
-            )
+            # Memory Write: Generate write vector và q_mu
+            write_vector = self.memory_interface.generate_key_value(last_hidden.squeeze(0))[1]
+            q_mu = query  # Simplified: use query as q_mu
             
-            # Update statistics
-            self.stats["total_retrievals"] += 1
+            # Update memory matrix
+            self.memory_write(z, write_vector, q_mu)
             
-            # Update access counts
-            for info in memory_info:
-                memory_id = info["id"]
-                for entry in self.memory_bank:
-                    if entry.id == memory_id:
-                        entry.usage_count += 1
-                        entry.last_accessed = self.timestep
-                        break
+            # NN Output: uad = -Ŵᵀ(σ(V̂ᵀx̃ + b̂v) + Mr) - b̂w
+            x_tilde = x[:, -1, :].squeeze(0)  # Last input
+            output = self.nn_output(x_tilde, Mr)
+            
+            # Prepare memory info for compatibility
+            memory_info = [{
+                "id": f"memory_{i}",
+                "content": f"Memory slot {i}",
+                "context": "External Working Memory",
+                "similarity": z[i].item(),
+                "attention_weight": z[i].item(),
+                "importance_weight": 1.0,
+                "usage_count": 0,
+                "tags": ["external_memory"]
+            } for i in range(min(len(z), 3))]
+            
         else:
-            retrieved_memory = torch.zeros(self.memory_dim, device=self.device)
+            # No memory retrieval
+            output = torch.zeros(self.output_size, device=self.device)
             memory_info = []
-        
-        # Combine controller output with retrieved memory
-        if retrieved_memory.dim() == 1:
-            retrieved_memory = retrieved_memory.unsqueeze(0)
-        combined_input = torch.cat([last_hidden, retrieved_memory], dim=-1)
-        
-        # Final output
-        output = self.output_layer(combined_input)
         
         self.timestep += 1
         
-        return output, memory_info
+        return output.unsqueeze(0), memory_info
     
     def add_memory(self, 
                    content: str,
@@ -488,6 +600,17 @@ class MemoryAugmentedNetwork(nn.Module):
         # Sort by similarity and importance
         results.sort(key=lambda x: x["similarity"] * x["importance_weight"], reverse=True)
         
+        # Update usage count for retrieved memories
+        for result in results[:top_k]:
+            memory_id = result["id"]
+            for entry in self.memory_bank:
+                if entry.id == memory_id:
+                    entry.usage_count += 1
+                    break
+        
+        # Update statistics
+        self.stats["total_retrievals"] += len(results[:top_k])
+        
         return results[:top_k]
     
     def _remove_least_important_memory(self) -> None:
@@ -511,22 +634,38 @@ class MemoryAugmentedNetwork(nn.Module):
     
     def get_memory_statistics(self) -> Dict[str, Any]:
         """Get memory bank statistics"""
-        if not self.memory_bank:
-            return {"total_memories": 0}
-        
-        importance_weights = [entry.importance_weight for entry in self.memory_bank]
-        usage_counts = [entry.usage_count for entry in self.memory_bank]
-        
-        return {
+        stats = {
             "total_memories": len(self.memory_bank),
             "memory_utilization": self.stats["memory_utilization"],
             "total_retrievals": self.stats["total_retrievals"],
             "total_writes": self.stats["total_writes"],
-            "avg_importance": np.mean(importance_weights),
-            "avg_usage_count": np.mean(usage_counts),
-            "max_importance": np.max(importance_weights),
-            "min_importance": np.min(importance_weights)
+            "memory_matrix_shape": list(self.memory_matrix.shape),
+            "memory_matrix_norm": torch.norm(self.memory_matrix).item(),
+            "W_hat_norm": torch.norm(self.W_hat).item(),
+            "V_hat_norm": torch.norm(self.V_hat).item(),
+            "b_v_norm": torch.norm(self.b_v).item(),
+            "b_w_norm": torch.norm(self.b_w).item()
         }
+        
+        if self.memory_bank:
+            importance_weights = [entry.importance_weight for entry in self.memory_bank]
+            usage_counts = [entry.usage_count for entry in self.memory_bank]
+            
+            stats.update({
+                "avg_importance": np.mean(importance_weights),
+                "avg_usage_count": np.mean(usage_counts),
+                "max_importance": np.max(importance_weights),
+                "min_importance": np.min(importance_weights)
+            })
+        else:
+            stats.update({
+                "avg_importance": 0.0,
+                "avg_usage_count": 0.0,
+                "max_importance": 0.0,
+                "min_importance": 0.0
+            })
+        
+        return stats
     
     def save_memory_bank(self, filepath: str) -> None:
         """Save memory bank to file"""
@@ -535,7 +674,12 @@ class MemoryAugmentedNetwork(nn.Module):
         data = {
             "memory_bank": [entry.to_dict() for entry in self.memory_bank],
             "timestep": self.timestep,
-            "stats": self.stats
+            "stats": self.stats,
+            "memory_matrix": self.memory_matrix.detach().cpu().numpy().tolist(),
+            "W_hat": self.W_hat.detach().cpu().numpy().tolist(),
+            "V_hat": self.V_hat.detach().cpu().numpy().tolist(),
+            "b_v": self.b_v.detach().cpu().numpy().tolist(),
+            "b_w": self.b_w.detach().cpu().numpy().tolist()
         }
         
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -560,7 +704,19 @@ class MemoryAugmentedNetwork(nn.Module):
             self.timestep = data.get("timestep", 0)
             self.stats.update(data.get("stats", {}))
             
-            self.logger.info(f"Loaded {len(self.memory_bank)} memories from {filepath}")
+            # Load External Working Memory parameters
+            if "memory_matrix" in data:
+                self.memory_matrix.data = torch.tensor(data["memory_matrix"], device=self.device)
+            if "W_hat" in data:
+                self.W_hat.data = torch.tensor(data["W_hat"], device=self.device)
+            if "V_hat" in data:
+                self.V_hat.data = torch.tensor(data["V_hat"], device=self.device)
+            if "b_v" in data:
+                self.b_v.data = torch.tensor(data["b_v"], device=self.device)
+            if "b_w" in data:
+                self.b_w.data = torch.tensor(data["b_w"], device=self.device)
+            
+            self.logger.info(f"Loaded {len(self.memory_bank)} memories and External Working Memory from {filepath}")
             return True
             
         except Exception as e:

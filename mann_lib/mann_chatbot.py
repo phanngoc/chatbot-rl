@@ -173,34 +173,36 @@ class MANNChatbot:
     async def _generate_response(self, user_input: str, memory_info: List[Dict]) -> str:
         """Generate response based on user input và retrieved memories"""
         
+        # Try to use memory_info first, but fallback to search if needed
+        relevant_memories = []
+        
+        # Check if memory_info contains actual memory content (not just "Memory slot X")
+        if memory_info and any("Memory slot" not in mem.get("content", "") for mem in memory_info):
+            # Use memory_info if it contains real content
+            relevant_memories = [mem.get("content", "") for mem in memory_info if mem.get("content") and "Memory slot" not in mem.get("content", "")]
+        elif self.mann_model.memory_bank:
+            # Fallback to search from memory bank
+            search_results = self.mann_model.search_memories(user_input, top_k=3)
+            relevant_memories = [mem["content"] for mem in search_results]
+        
         # Simple response generation (in production, use LLM)
-        if not memory_info:
+        if not relevant_memories:
             return f"Tôi hiểu bạn đang nói về: '{user_input}'. Đây là lần đầu tiên tôi nghe về chủ đề này. Bạn có thể chia sẻ thêm thông tin không?"
         
         # Use retrieved memories to generate response
-        relevant_memories = [mem["content"] for mem in memory_info[:3]]
-        memory_context = " ".join(relevant_memories)
+        memory_context = " ".join(relevant_memories[:1])  # Use top 1 memory only
         
         # Simple template-based response
-        response_templates = [
-            f"Dựa trên những gì tôi nhớ, {memory_context}. Về '{user_input}', tôi nghĩ...",
-            f"Tôi nhớ rằng {memory_context}. Liên quan đến '{user_input}', có vẻ như...",
-            f"Từ kinh nghiệm trước, {memory_context}. Với '{user_input}', tôi có thể chia sẻ..."
-        ]
-        
-        # Select template based on memory relevance
-        template_idx = hash(user_input) % len(response_templates)
-        base_response = response_templates[template_idx]
-        
-        # Add specific response based on input
         if "tên" in user_input.lower() or "name" in user_input.lower():
-            return f"{base_response} Tên của bạn là gì? Tôi muốn nhớ để gọi bạn đúng cách."
+            return f"Tôi nhớ bạn đã nói về tên. Bạn có thể nhắc lại tên của bạn không?"
         elif "thích" in user_input.lower() or "like" in user_input.lower():
-            return f"{base_response} Bạn thích gì? Tôi muốn hiểu sở thích của bạn hơn."
+            return f"Tôi biết bạn có sở thích. Bạn có thể chia sẻ thêm về sở thích của bạn không?"
         elif "làm gì" in user_input.lower() or "what" in user_input.lower():
-            return f"{base_response} Bạn đang làm gì? Tôi quan tâm đến hoạt động của bạn."
+            return f"Bạn đang làm gì? Tôi quan tâm đến hoạt động của bạn."
+        elif "nhớ" in user_input.lower() or "remember" in user_input.lower():
+            return f"Tôi đang cố gắng nhớ những gì bạn đã nói. Bạn có thể nhắc lại không?"
         else:
-            return f"{base_response} Bạn có thể chia sẻ thêm về chủ đề này không?"
+            return f"Tôi hiểu bạn đang nói về: '{user_input}'. Bạn có thể chia sẻ thêm thông tin không?"
     
     def _should_store_memory(self, user_input: str, response: str) -> bool:
         """Determine if interaction should be stored as memory"""
@@ -218,7 +220,12 @@ class MANNChatbot:
         recent_inputs = [conv["user_input"].lower() for conv in self.conversation_history[-5:]]
         is_new = not any(user_lower in recent for recent in recent_inputs)
         
-        return has_important_keywords or (is_substantial and is_new)
+        # Check if this content already exists in memory bank (prevent duplicates)
+        content_to_check = f"User: {user_input}\nBot: {response}"
+        existing_contents = [mem.content for mem in self.mann_model.memory_bank]
+        is_duplicate = any(content_to_check in existing_content for existing_content in existing_contents)
+        
+        return (has_important_keywords or (is_substantial and is_new)) and not is_duplicate
     
     async def _store_interaction_memory(self, user_input: str, response: str, memory_info: List[Dict]):
         """Store interaction as memory"""
