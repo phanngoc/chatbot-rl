@@ -16,6 +16,8 @@ import os
 import logging
 from datetime import datetime
 import uuid
+from torch.distributions import Categorical
+from openai import OpenAI
 
 
 @dataclass
@@ -78,13 +80,76 @@ class MemoryBankEntry:
         )
 
 
-class MemoryInterface(nn.Module):
-    """Interface để tương tác với memory bank"""
+class PolicyNetwork(nn.Module):
+    """PPO Policy Network for answer generation"""
     
-    def __init__(self, hidden_size: int, memory_dim: int):
+    def __init__(self, hidden_size: int, memory_dim: int, vocab_size: int):
         super().__init__()
         self.hidden_size = hidden_size
         self.memory_dim = memory_dim
+        self.vocab_size = vocab_size
+        
+        # Policy head for answer generation
+        self.policy_head = nn.Sequential(
+            nn.Linear(hidden_size + memory_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, vocab_size)
+        )
+        
+        # Value head for advantage estimation
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_size + memory_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1)
+        )
+    
+    def forward(self, hidden_state: torch.Tensor, memory_context: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for policy and value
+        
+        Args:
+            hidden_state: Controller hidden state
+            memory_context: Retrieved memory context
+            
+        Returns:
+            logits: Policy logits for answer generation
+            value: State value estimation
+        """
+        # Combine hidden state and memory context
+        combined_input = torch.cat([hidden_state, memory_context], dim=-1)
+        
+        # Policy logits
+        logits = self.policy_head(combined_input)
+        
+        # Value estimation
+        value = self.value_head(combined_input)
+        
+        return logits, value
+    
+    def get_action_prob(self, logits: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """Get probability of action given logits"""
+        probs = F.softmax(logits, dim=-1)
+        
+        # Ensure action has proper dimensions for gather
+        if action.dim() == 1 and probs.dim() == 1:
+            # Both are 1D, use indexing
+            return probs[action]
+        elif action.dim() == 1 and probs.dim() == 2:
+            # action is 1D, probs is 2D, add batch dimension to action
+            return probs.gather(-1, action.unsqueeze(0).unsqueeze(-1)).squeeze(-1)
+        else:
+            # General case with proper unsqueeze
+            return probs.gather(-1, action.unsqueeze(-1)).squeeze(-1)
+
+
+class MemoryInterface(nn.Module):
+    """Interface để tương tác với memory bank"""
+    
+    def __init__(self, hidden_size: int, memory_dim: int, vocab_size: int = 10000):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.memory_dim = memory_dim
+        self.vocab_size = vocab_size
         
         # Query generation
         self.query_generator = nn.Linear(hidden_size, memory_dim)
@@ -95,6 +160,151 @@ class MemoryInterface(nn.Module):
         
         # Importance weight generator
         self.importance_generator = nn.Linear(hidden_size, 1)
+        
+        # PPO Policy networks
+        self.current_policy = PolicyNetwork(hidden_size, memory_dim, vocab_size)
+        self.old_policy = PolicyNetwork(hidden_size, memory_dim, vocab_size)
+        
+        # Copy parameters to old policy
+        self.update_old_policy()
+        
+        # PPO hyperparameters
+        self.clip_epsilon = 0.2
+        self.entropy_coeff = 0.01
+        self.value_loss_coeff = 0.5
+    
+    def update_old_policy(self):
+        """Update old policy with current policy parameters"""
+        self.old_policy.load_state_dict(self.current_policy.state_dict())
+    
+    def compute_ppo_importance_ratio(self, 
+                                   hidden_state: torch.Tensor, 
+                                   memory_context: torch.Tensor,
+                                   actions: torch.Tensor) -> torch.Tensor:
+        """
+        Compute PPO importance ratio: ρ_θ(q, M_ret) = π_θ(y | q, M_ret) / π_old(y | q, M_ret)
+        
+        Args:
+            hidden_state: Controller hidden state (query q)
+            memory_context: Retrieved memories (M_ret)
+            actions: Generated answer tokens (y)
+            
+        Returns:
+            importance_ratio: PPO importance ratio
+        """
+        # Current policy probabilities
+        current_logits, _ = self.current_policy(hidden_state, memory_context)
+        current_probs = self.current_policy.get_action_prob(current_logits, actions)
+        
+        # Old policy probabilities
+        with torch.no_grad():
+            old_logits, _ = self.old_policy(hidden_state, memory_context)
+            old_probs = self.old_policy.get_action_prob(old_logits, actions)
+        
+        # Importance ratio
+        importance_ratio = current_probs / (old_probs + 1e-8)
+        
+        return importance_ratio
+    
+    def compute_ppo_loss(self,
+                        hidden_state: torch.Tensor,
+                        memory_context: torch.Tensor,
+                        actions: torch.Tensor,
+                        advantages: torch.Tensor,
+                        returns: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Compute PPO loss with clipping mechanism
+        
+        Args:
+            hidden_state: Controller hidden state
+            memory_context: Retrieved memory context
+            actions: Answer tokens
+            advantages: Computed advantages from answer quality
+            returns: Value targets
+            
+        Returns:
+            losses: Dictionary containing policy, value, and total loss
+        """
+        # Get current policy outputs
+        logits, values = self.current_policy(hidden_state, memory_context)
+        
+        # Expand values to match batch size
+        if values.dim() == 0 or (values.dim() == 1 and values.size(0) == 1):
+            values = values.expand(len(returns))
+        
+        # Compute importance ratio
+        importance_ratio = self.compute_ppo_importance_ratio(hidden_state, memory_context, actions)
+        
+        # PPO clipped surrogate objective
+        clipped_ratio = torch.clamp(importance_ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon)
+        
+        # Policy loss with clipping
+        policy_loss_unclipped = importance_ratio * advantages
+        policy_loss_clipped = clipped_ratio * advantages
+        policy_loss = -torch.min(policy_loss_unclipped, policy_loss_clipped).mean()
+        
+        # Value loss
+        value_loss = F.mse_loss(values, returns)
+        
+        # Entropy bonus for exploration
+        probs = F.softmax(logits, dim=-1)
+        entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
+        entropy_loss = -self.entropy_coeff * entropy
+        
+        # Total loss
+        total_loss = policy_loss + self.value_loss_coeff * value_loss + entropy_loss
+        
+        return {
+            'policy_loss': policy_loss,
+            'value_loss': value_loss,
+            'entropy_loss': entropy_loss,
+            'total_loss': total_loss,
+            'importance_ratio': importance_ratio.mean(),
+            'entropy': entropy
+        }
+    
+    def compute_advantages(self, 
+                          rewards: torch.Tensor, 
+                          values: torch.Tensor,
+                          gamma: float = 0.99,
+                          gae_lambda: float = 0.95) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute advantages using Generalized Advantage Estimation (GAE)
+        
+        Args:
+            rewards: Rewards from answer quality evaluation
+            values: Value estimates from policy network
+            gamma: Discount factor
+            gae_lambda: GAE lambda parameter
+            
+        Returns:
+            advantages: Computed advantages
+            returns: Value targets
+        """
+        advantages = []
+        gae = 0
+        
+        # Compute advantages backwards
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                next_value = 0
+            else:
+                next_value = values[t + 1].item() if hasattr(values[t + 1], 'item') else values[t + 1]
+            
+            reward_t = rewards[t].item() if hasattr(rewards[t], 'item') else rewards[t]
+            value_t = values[t].item() if hasattr(values[t], 'item') else values[t]
+            
+            delta = reward_t + gamma * next_value - value_t
+            gae = delta + gamma * gae_lambda * gae
+            advantages.insert(0, gae)
+        
+        advantages = torch.tensor(advantages, device=values.device, dtype=torch.float32)
+        returns = advantages + values
+        
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        return advantages, returns
     
     def generate_query(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """Generate query vector từ hidden state"""
@@ -151,26 +361,36 @@ class MemoryInterface(nn.Module):
         query_norm = F.normalize(query_input, p=2, dim=-1)
         keys_norm = F.normalize(keys, p=2, dim=-1)
         
-        # Ensure query_norm is 2D for matrix multiplication
-        if query_norm.dim() == 1:
-            query_norm = query_norm.unsqueeze(0)  # [1, memory_dim]
+        # Ensure query_norm is 1D for proper dot product
+        if query_norm.dim() > 1:
+            query_norm = query_norm.squeeze()
+            
+        # If still not 1D (e.g., batch dimension), take first element
+        if query_norm.dim() > 1:
+            query_norm = query_norm[0]
         
-        similarities = torch.mm(query_norm, keys_norm.t()).squeeze(0)
+        # Compute dot product similarities: keys_norm [num_memories, memory_dim] @ query_norm [memory_dim]
+        similarities = torch.mv(keys_norm, query_norm)  # [num_memories]
         
         # Apply importance weights
         weighted_similarities = similarities * importance_weights
         
         # Get top-k indices
         top_k = min(top_k, len(memory_bank))
-        top_indices = torch.topk(weighted_similarities, top_k).indices
+        topk_result = torch.topk(weighted_similarities, top_k)
+        top_indices = topk_result.indices
         
         # Calculate attention weights
         top_similarities = weighted_similarities[top_indices]
         attention_weights = F.softmax(top_similarities, dim=0)
         
         # Weighted sum of values
-        top_values = values[top_indices]
-        retrieved_memory = torch.sum(attention_weights.unsqueeze(-1) * top_values, dim=0)
+        top_values = values[top_indices]  # [top_k, memory_dim]
+        attention_weights_expanded = attention_weights.unsqueeze(-1)  # [top_k, 1]
+        
+        # Ensure proper broadcasting: [top_k, 1] * [top_k, memory_dim] = [top_k, memory_dim]
+        weighted_values = attention_weights_expanded * top_values
+        retrieved_memory = torch.sum(weighted_values, dim=0)  # [memory_dim]
         
         # Prepare memory info
         memory_info = []
@@ -223,7 +443,7 @@ class MemoryAugmentedNetwork(nn.Module):
         self.b_w = nn.Parameter(torch.zeros(output_size))
         
         # Memory interface với proper query generation
-        self.memory_interface = MemoryInterface(hidden_size, memory_dim)
+        self.memory_interface = MemoryInterface(hidden_size, memory_dim, output_size)
         
         # Memory matrix μ ∈ R^(memory_dim × memory_size)
         self.memory_matrix = nn.Parameter(torch.randn(memory_dim, memory_size) * 0.1)
@@ -244,6 +464,13 @@ class MemoryAugmentedNetwork(nn.Module):
         }
         
         self.logger = logging.getLogger("MANN")
+        
+        # Initialize OpenAI client for embeddings (with error handling)
+        try:
+            self.openai_client = OpenAI()
+        except Exception as e:
+            self.logger.warning(f"OpenAI client initialization failed: {e}")
+            self.openai_client = None
     
     def to(self, device):
         """Move model đến device cụ thể"""
@@ -320,6 +547,13 @@ class MemoryAugmentedNetwork(nn.Module):
         # z = softmax(μᵀq)
         # μᵀ shape: [memory_size, memory_dim], query shape: [memory_dim]
         # Result: [memory_size]
+        
+        # Ensure query is 1D
+        if query.dim() > 1:
+            query = query.squeeze()
+        if query.dim() > 1:
+            query = query[0]
+            
         z = F.softmax(torch.mv(self.memory_matrix.t(), query), dim=0)
         
         # Mr = μz
@@ -549,12 +783,55 @@ class MemoryAugmentedNetwork(nn.Module):
         
         return False
     
+    def _get_embedding(self, text: str) -> np.ndarray:
+        """Generate OpenAI embedding for text"""
+        if self.openai_client is None:
+            # Fallback to simple word-based similarity if no OpenAI client
+            return self._get_simple_text_vector(text)
+            
+        try:
+            response = self.openai_client.embeddings.create(
+                model="text-embedding-3-small",
+                input=text
+            )
+            return np.array(response.data[0].embedding)
+        except Exception as e:
+            self.logger.warning(f"Failed to get embedding: {e}")
+            # Fallback to simple text vector
+            return self._get_simple_text_vector(text)
+    
+    def _get_simple_text_vector(self, text: str) -> np.ndarray:
+        """Simple fallback text vectorization"""
+        # Create a simple hash-based vector for fallback
+        words = text.lower().split()
+        vector = np.zeros(1536)  # Same dimension as OpenAI embeddings
+        
+        for word in words[:100]:  # Limit to 100 words
+            # Simple hash to vector index
+            hash_val = hash(word) % 1536
+            vector[hash_val] += 1.0
+        
+        # Normalize
+        norm = np.linalg.norm(vector)
+        if norm > 0:
+            vector = vector / norm
+            
+        return vector
+    
+    def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Calculate cosine similarity between two vectors"""
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return np.dot(a, b) / (norm_a * norm_b)
+    
     def search_memories(self, 
                        query: str,
                        top_k: int = 5,
                        min_similarity: float = 0.0) -> List[Dict[str, Any]]:
         """
-        Search memories by content similarity
+        Search memories by content similarity using OpenAI embeddings
         
         Args:
             query: Search query
@@ -567,22 +844,20 @@ class MemoryAugmentedNetwork(nn.Module):
         if not self.memory_bank:
             return []
         
-        # Simple text-based similarity (in production, use embeddings)
-        query_lower = query.lower()
+        # Generate embedding for query
+        query_embedding = self._get_embedding(query)
         results = []
         
         for entry in self.memory_bank:
-            content_lower = entry.content.lower()
-            context_lower = entry.context.lower()
+            # Generate embeddings for content and context
+            content_embedding = self._get_embedding(entry.content)
+            context_embedding = self._get_embedding(entry.context)
             
-            # Calculate simple similarity
-            content_words = set(content_lower.split())
-            context_words = set(context_lower.split())
-            query_words = set(query_lower.split())
+            # Calculate cosine similarity
+            content_sim = self._cosine_similarity(query_embedding, content_embedding)
+            context_sim = self._cosine_similarity(query_embedding, context_embedding)
             
-            content_sim = len(content_words.intersection(query_words)) / max(len(query_words), 1)
-            context_sim = len(context_words.intersection(query_words)) / max(len(query_words), 1)
-            
+            # Take maximum similarity
             similarity = max(content_sim, context_sim)
             
             if similarity >= min_similarity:
@@ -722,3 +997,294 @@ class MemoryAugmentedNetwork(nn.Module):
         except Exception as e:
             self.logger.error(f"Failed to load memory bank: {e}")
             return False
+    
+    def ppo_forward_with_memory(self, 
+                               x: torch.Tensor, 
+                               questions: List[str],
+                               generate_answers: bool = True) -> Dict[str, Any]:
+        """
+        PPO forward pass with memory retrieval for answer generation
+        
+        Args:
+            x: Input tensor [batch_size, seq_len, input_size]
+            questions: List of questions for context
+            generate_answers: Whether to generate answer probabilities
+            
+        Returns:
+            results: Dictionary with logits, values, memory context, and retrieved memories
+        """
+        batch_size, seq_len, input_size = x.shape
+        
+        # Controller forward pass
+        controller_output, (hidden_state, cell_state) = self.controller(x)
+        last_hidden = controller_output[:, -1, :]  # [batch_size, hidden_size]
+        
+        # For PPO, we need to process each sample in the batch individually
+        # For now, use the first sample for memory retrieval
+        first_hidden = last_hidden[0]  # [hidden_size]
+        
+        # Generate query for memory retrieval
+        query = self.memory_interface.generate_query(first_hidden.unsqueeze(0))  # Add batch dim back
+        
+        # Retrieve memories using memory interface
+        retrieved_memory, memory_info = self.memory_interface.retrieve(
+            query, self.memory_bank, top_k=3
+        )
+        
+        # External Working Memory operations
+        Mr, z = self.memory_read(query)
+        
+        # Generate write vector and update memory
+        write_vector = self.memory_interface.generate_key_value(first_hidden.unsqueeze(0))[1]
+        q_mu = query.squeeze(0) if query.dim() > 1 else query
+        self.memory_write(z, write_vector, q_mu)
+        
+        # Combine retrieved memory with working memory
+        combined_memory = retrieved_memory + Mr
+        
+        if generate_answers:
+            # Get policy network outputs for answer generation
+            logits, values = self.memory_interface.current_policy(
+                first_hidden, 
+                combined_memory
+            )
+        else:
+            logits, values = None, None
+        
+        return {
+            'logits': logits,
+            'values': values,
+            'hidden_state': first_hidden,
+            'memory_context': combined_memory,
+            'retrieved_memories': memory_info,
+            'attention_weights': z,
+            'working_memory': Mr,
+            'episodic_memory': retrieved_memory
+        }
+    
+    def compute_answer_rewards(self, 
+                              generated_answers: List[str],
+                              reference_answers: List[str],
+                              questions: List[str]) -> torch.Tensor:
+        """
+        Compute rewards based on answer quality (exact match, similarity, etc.)
+        
+        Args:
+            generated_answers: Generated answers from policy
+            reference_answers: Ground truth answers
+            questions: Original questions for context
+            
+        Returns:
+            rewards: Tensor of rewards for each answer
+        """
+        rewards = []
+        
+        for gen_ans, ref_ans, question in zip(generated_answers, reference_answers, questions):
+            # Simple exact match reward (can be enhanced with semantic similarity)
+            if gen_ans.strip().lower() == ref_ans.strip().lower():
+                reward = 1.0  # Perfect match
+            else:
+                # Compute word overlap similarity
+                gen_words = set(gen_ans.lower().split())
+                ref_words = set(ref_ans.lower().split())
+                
+                if len(ref_words) > 0:
+                    overlap = len(gen_words.intersection(ref_words)) / len(ref_words)
+                    reward = overlap
+                else:
+                    reward = 0.0
+            
+            # Bonus for using relevant memories
+            memory_bonus = 0.1  # Small bonus for memory utilization
+            reward += memory_bonus
+            
+            rewards.append(reward)
+        
+        return torch.tensor(rewards, dtype=torch.float32)
+    
+    def ppo_update(self,
+                   questions: List[str],
+                   generated_answers: List[str],
+                   reference_answers: List[str],
+                   input_tensors: torch.Tensor,
+                   learning_rate: float = 3e-4,
+                   epochs: int = 4) -> Dict[str, float]:
+        """
+        PPO update step following the paper's formulation
+        
+        Args:
+            questions: Input questions
+            generated_answers: Generated answers from current policy
+            reference_answers: Ground truth answers for reward computation
+            input_tensors: Input tensors used for generation
+            learning_rate: Learning rate for optimization
+            epochs: Number of PPO epochs
+            
+        Returns:
+            training_stats: Dictionary with training statistics
+        """
+        # Get current policy outputs
+        forward_results = self.ppo_forward_with_memory(input_tensors, questions, generate_answers=True)
+        
+        hidden_state = forward_results['hidden_state']
+        memory_context = forward_results['memory_context']
+        current_logits = forward_results['logits']
+        current_values = forward_results['values']
+        
+        # Convert generated answers to token indices (simplified - would need proper tokenization)
+        answer_tokens = torch.randint(0, self.memory_interface.vocab_size, (len(generated_answers),))
+        
+        # DEBUG LOGGING START
+        debug_log_path = "debug_reward_process.log"
+        with open(debug_log_path, "a") as debug_file:
+            debug_file.write(f"\n=== REWARD PROCESS DEBUG - {datetime.now()} ===\n")
+            debug_file.write(f"Batch size: {len(generated_answers)}\n")
+            debug_file.write(f"Vocab size: {self.memory_interface.vocab_size}\n")
+            debug_file.write(f"Answer tokens shape: {answer_tokens.shape}\n")
+            debug_file.write(f"Answer tokens sample: {answer_tokens[:5].tolist()}\n")
+            
+            debug_file.write("\n--- GENERATED ANSWERS ---\n")
+            for i, answer in enumerate(generated_answers):
+                debug_file.write(f"[{i}] Generated: {repr(answer)}\n")
+            
+            debug_file.write("\n--- REFERENCE ANSWERS ---\n")
+            for i, ref_answer in enumerate(reference_answers):
+                debug_file.write(f"[{i}] Reference: {repr(ref_answer)}\n")
+            
+            debug_file.write("\n--- QUESTIONS ---\n")
+            for i, question in enumerate(questions):
+                debug_file.write(f"[{i}] Question: {repr(question)}\n")
+        
+        # Compute rewards from answer quality
+        rewards = self.compute_answer_rewards(generated_answers, reference_answers, questions)
+        
+        # DEBUG LOGGING - REWARDS
+        with open(debug_log_path, "a") as debug_file:
+            debug_file.write(f"\n--- REWARDS COMPUTATION ---\n")
+            debug_file.write(f"Rewards shape: {rewards.shape if hasattr(rewards, 'shape') else len(rewards)}\n")
+            debug_file.write(f"Rewards dtype: {rewards.dtype if hasattr(rewards, 'dtype') else type(rewards)}\n")
+            debug_file.write(f"Rewards values: {rewards.tolist() if hasattr(rewards, 'tolist') else list(rewards)}\n")
+            debug_file.write(f"Rewards stats - mean: {torch.mean(rewards) if hasattr(rewards, 'mean') else sum(rewards)/len(rewards):.4f}, ")
+            debug_file.write(f"std: {torch.std(rewards) if hasattr(rewards, 'std') else 'N/A':.4f}, ")
+            debug_file.write(f"min: {torch.min(rewards) if hasattr(rewards, 'min') else min(rewards):.4f}, ")
+            debug_file.write(f"max: {torch.max(rewards) if hasattr(rewards, 'max') else max(rewards):.4f}\n")
+        
+        # Create values for each sample (simplified - using same value for all samples)
+        batch_values = current_values.squeeze(-1).repeat(len(rewards))
+        
+        # DEBUG LOGGING - VALUES
+        with open(debug_log_path, "a") as debug_file:
+            debug_file.write(f"\n--- VALUES COMPUTATION ---\n")
+            debug_file.write(f"Current values shape: {current_values.shape}\n")
+            debug_file.write(f"Current values: {current_values.tolist()}\n")
+            debug_file.write(f"Batch values shape: {batch_values.shape}\n")
+            debug_file.write(f"Batch values: {batch_values.tolist()}\n")
+        
+        # Compute advantages and returns
+        advantages, returns = self.memory_interface.compute_advantages(
+            rewards, batch_values
+        )
+        
+        # DEBUG LOGGING - ADVANTAGES & RETURNS
+        with open(debug_log_path, "a") as debug_file:
+            debug_file.write(f"\n--- ADVANTAGES & RETURNS ---\n")
+            debug_file.write(f"Advantages shape: {advantages.shape}\n")
+            debug_file.write(f"Advantages: {advantages.tolist()}\n")
+            debug_file.write(f"Advantages stats - mean: {torch.mean(advantages):.4f}, std: {torch.std(advantages):.4f}\n")
+            
+            debug_file.write(f"Returns shape: {returns.shape}\n")
+            debug_file.write(f"Returns: {returns.tolist()}\n")
+            debug_file.write(f"Returns stats - mean: {torch.mean(returns):.4f}, std: {torch.std(returns):.4f}\n")
+            debug_file.write("=== END DEBUG ===\n\n")
+        
+        self.logger.info(f"Debug information logged to {debug_log_path}")
+        # DEBUG LOGGING END
+        
+        # Set up optimizer
+        optimizer = torch.optim.Adam(self.memory_interface.current_policy.parameters(), lr=learning_rate)
+        
+        # PPO training loop
+        total_losses = []
+        
+        for epoch in range(epochs):
+            # Zero gradients first
+            optimizer.zero_grad()
+            
+            # Compute PPO loss - detach inputs that shouldn't propagate gradients
+            loss_dict = self.memory_interface.compute_ppo_loss(
+                hidden_state.detach(),    # Detach hidden state 
+                memory_context.detach(),  # Detach memory context
+                answer_tokens,
+                advantages.detach(),      # Detach advantages to avoid gradient issues
+                returns.detach()          # Detach returns to avoid gradient issues
+            )
+            
+            # Backward pass
+            loss_dict['total_loss'].backward()
+            
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(self.memory_interface.current_policy.parameters(), 0.5)
+            
+            optimizer.step()
+            
+            total_losses.append(loss_dict['total_loss'].item())
+        
+        # Update old policy after training
+        self.memory_interface.update_old_policy()
+        
+        # Training statistics
+        training_stats = {
+            'avg_loss': np.mean(total_losses),
+            'avg_reward': rewards.mean().item(),
+            'avg_advantage': advantages.mean().item(),
+            'policy_entropy': loss_dict['entropy'].item(),
+            'importance_ratio': loss_dict['importance_ratio'].item(),
+            'memories_retrieved': len(forward_results['retrieved_memories'])
+        }
+        
+        self.logger.info(f"PPO Update - Loss: {training_stats['avg_loss']:.4f}, "
+                        f"Reward: {training_stats['avg_reward']:.4f}, "
+                        f"Memories: {training_stats['memories_retrieved']}")
+        
+        return training_stats
+    
+    def generate_answer_with_ppo(self, 
+                                question: str,
+                                input_tensor: torch.Tensor,
+                                max_length: int = 50) -> Tuple[str, List[Dict]]:
+        """
+        Generate answer using PPO-trained policy with memory retrieval
+        
+        Args:
+            question: Input question
+            input_tensor: Input tensor representation
+            max_length: Maximum answer length
+            
+        Returns:
+            generated_answer: Generated answer string
+            memory_info: Information about retrieved memories
+        """
+        with torch.no_grad():
+            # Forward pass with memory retrieval
+            results = self.ppo_forward_with_memory(
+                input_tensor.unsqueeze(0), 
+                [question], 
+                generate_answers=True
+            )
+            
+            logits = results['logits']
+            memory_info = results['retrieved_memories']
+            
+            # Sample answer tokens from policy
+            probs = F.softmax(logits, dim=-1)
+            sampled_tokens = torch.multinomial(probs, 1).squeeze(-1)
+            
+            # Convert tokens to answer (simplified - would need proper detokenization)
+            generated_answer = f"Generated answer with token {sampled_tokens.item()}"
+            
+            # Add memory context to answer
+            if memory_info:
+                memory_context = " | ".join([mem['content'][:30] for mem in memory_info[:2]])
+                generated_answer += f" (using memories: {memory_context})"
+        
+        return generated_answer, memory_info

@@ -280,6 +280,292 @@ async def demo_external_working_memory():
         await chatbot.shutdown()
 
 
+async def demo_ppo_training():
+    """Demo PPO training with memory-augmented network"""
+    print("\n🎯 Demo: PPO Training with Memory")
+    print("=" * 50)
+    
+    import torch
+    import numpy as np
+    import os
+    from standalone_mann.mann_core import MemoryAugmentedNetwork
+    
+    # Clear any existing debug log
+    debug_log_path = "debug_reward_process.log"
+    if os.path.exists(debug_log_path):
+        os.remove(debug_log_path)
+        print(f"🗑️  Cleared existing debug log: {debug_log_path}")
+    
+    # Create a simple MANN model for testing
+    print("🧠 Initializing MANN model for PPO training...")
+    
+    # Model configuration
+    input_size = 64
+    hidden_size = 128
+    memory_size = 20  # Reduced for cleaner debugging
+    memory_dim = 64
+    output_size = 1000  # Vocabulary size
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"  Using device: {device}")
+    
+    try:
+        # Initialize model
+        mann_model = MemoryAugmentedNetwork(
+            input_size=input_size,
+            hidden_size=hidden_size, 
+            memory_size=memory_size,
+            memory_dim=memory_dim,
+            output_size=output_size,
+            device=device
+        ).to(device)
+        
+        print(f"  Model initialized with {sum(p.numel() for p in mann_model.parameters())} parameters")
+        
+        # Clear any existing memory bank
+        mann_model.memory_bank = []
+        print("  Cleared existing memory bank")
+        
+        # Add comprehensive test memories for better debugging
+        print("\n📝 Adding comprehensive test memories...")
+        test_memories = [
+            # Programming concepts
+            ("Python là ngôn ngữ lập trình cao cấp, dễ học và mạnh mẽ", "programming_context", ["python", "programming", "language"]),
+            ("JavaScript là ngôn ngữ web phổ biến cho frontend và backend", "web_context", ["javascript", "web", "frontend"]),
+            ("Java là ngôn ngữ hướng đối tượng mạnh mẽ cho enterprise", "enterprise_context", ["java", "oop", "enterprise"]),
+            
+            # AI/ML concepts
+            ("Machine Learning là nhánh của AI sử dụng dữ liệu để học", "ml_context", ["ml", "ai", "data"]),
+            ("Deep Learning sử dụng neural network nhiều lớp", "dl_context", ["deep_learning", "neural_network"]),
+            ("Natural Language Processing xử lý ngôn ngữ tự nhiên", "nlp_context", ["nlp", "language", "processing"]),
+            
+            # Frameworks
+            ("PyTorch là framework deep learning linh hoạt của Facebook", "framework_context", ["pytorch", "deep_learning", "facebook"]),
+            ("TensorFlow là platform ML mở của Google", "tf_context", ["tensorflow", "ml", "google"]),
+            ("Scikit-learn là thư viện ML cơ bản cho Python", "sklearn_context", ["sklearn", "ml", "python"]),
+            
+            # Algorithms
+            ("Reinforcement Learning học thông qua reward và punishment", "rl_context", ["rl", "reward", "learning"]),
+            ("PPO là thuật toán policy optimization ổn định", "ppo_context", ["ppo", "optimization", "policy"]),
+            ("Q-Learning học value function thông qua exploration", "qlearning_context", ["qlearning", "value", "exploration"])
+        ]
+        
+        for i, (content, context, tags) in enumerate(test_memories):
+            memory_id = mann_model.add_memory(content, context, tags, importance_weight=1.0 + i*0.1)
+            print(f"  [{i+1:2d}] Added: {memory_id[:8]}... - {content[:40]}...")
+        
+        # Generate comprehensive training data
+        print("\n🎲 Generating comprehensive training data...")
+        questions = [
+            "Python có ưu điểm gì?",
+            "Machine Learning hoạt động như thế nao?", 
+            "PyTorch khác TensorFlow như thế nào?",
+            "Reinforcement Learning là gì?",
+            "PPO algorithm có gì đặc biệt?",
+            "Deep Learning và Machine Learning khác nhau ra sao?",
+            "JavaScript dùng để làm gì?",
+            "Natural Language Processing giải quyết vấn đề gì?"
+        ]
+        
+        reference_answers = [
+            "Python là ngôn ngữ lập trình cao cấp, dễ học và mạnh mẽ",
+            "Machine Learning là nhánh của AI sử dụng dữ liệu để học",
+            "PyTorch là framework deep learning linh hoạt của Facebook", 
+            "Reinforcement Learning học thông qua reward và punishment",
+            "PPO là thuật toán policy optimization ổn định",
+            "Deep Learning sử dụng neural network nhiều lớp",
+            "JavaScript là ngôn ngữ web phổ biến cho frontend và backend",
+            "Natural Language Processing xử lý ngôn ngữ tự nhiên"
+        ]
+        
+        # Create input tensors
+        batch_size = len(questions)
+        seq_len = 10
+        input_tensors = torch.randn(batch_size, seq_len, input_size, device=device)
+        
+        print(f"  Created {batch_size} training samples")
+        
+        # Test PPO forward pass
+        print("\n🔄 Testing PPO forward pass...")
+        forward_results = mann_model.ppo_forward_with_memory(
+            input_tensors, questions, generate_answers=True
+        )
+        
+        print(f"  Forward pass completed:")
+        print(f"    Logits shape: {forward_results['logits'].shape}")
+        print(f"    Values shape: {forward_results['values'].shape}")
+        print(f"    Memory context shape: {forward_results['memory_context'].shape}")
+        print(f"    Retrieved memories: {len(forward_results['retrieved_memories'])}")
+        
+        # Generate answers using current policy (concise output)
+        print("\n🎯 Generating answers with current policy...")
+        generated_answers = []
+        
+        for i, question in enumerate(questions):
+            answer, memory_info = mann_model.generate_answer_with_ppo(
+                question, input_tensors[i], max_length=30  # Shorter for cleaner logs
+            )
+            generated_answers.append(answer)
+            print(f"  [{i+1}] Q: {question[:35]}...")
+            print(f"      A: {answer[:50]}...")
+            print(f"      Memories: {len(memory_info)}")
+        
+        # Test reward computation
+        print("\n🏆 Computing answer rewards...")
+        rewards = mann_model.compute_answer_rewards(
+            generated_answers, reference_answers, questions
+        )
+        reward_stats = {
+            'values': rewards.numpy().tolist(),
+            'mean': rewards.mean().item(),
+            'std': rewards.std().item(),
+            'min': rewards.min().item(),
+            'max': rewards.max().item()
+        }
+        print(f"  Rewards: {[f'{r:.3f}' for r in reward_stats['values']]}")
+        print(f"  Stats: mean={reward_stats['mean']:.3f}, std={reward_stats['std']:.3f}")
+        
+        # Perform PPO training step with detailed debugging
+        print(f"\n🚀 Performing PPO training step (epochs=2, lr=3e-4)...")
+        print(f"   📊 Check '{debug_log_path}' for detailed reward process debugging")
+        
+        training_stats = mann_model.ppo_update(
+            questions=questions,
+            generated_answers=generated_answers,
+            reference_answers=reference_answers,
+            input_tensors=input_tensors,
+            learning_rate=3e-4,
+            epochs=2  # Reduced for demo
+        )
+        
+        print(f"  ✅ Training completed:")
+        print(f"    📉 Loss: {training_stats['avg_loss']:.4f}")
+        print(f"    🏆 Reward: {training_stats['avg_reward']:.4f}")
+        print(f"    📈 Advantage: {training_stats['avg_advantage']:.4f}")
+        print(f"    🔀 Entropy: {training_stats['policy_entropy']:.4f}")
+        print(f"    ⚖️  Importance ratio: {training_stats['importance_ratio']:.4f}")
+        print(f"    💾 Memories retrieved: {training_stats['memories_retrieved']}")
+        
+        # Test after training (concise output)
+        print("\n🔄 Testing policy after training...")
+        new_generated_answers = []
+        
+        print(f"  Post-training answers (first 3 samples):")
+        for i, question in enumerate(questions[:3]):  # Show only first 3 for brevity
+            answer, memory_info = mann_model.generate_answer_with_ppo(
+                question, input_tensors[i], max_length=30
+            )
+            new_generated_answers.append(answer)
+            print(f"    [{i+1}] Q: {question[:30]}...")
+            print(f"        A: {answer[:40]}...")
+        
+        # Generate all new answers for comparison
+        for i, question in enumerate(questions[3:], 3):  # Complete remaining answers
+            answer, memory_info = mann_model.generate_answer_with_ppo(
+                question, input_tensors[i], max_length=30
+            )
+            new_generated_answers.append(answer)
+        
+        # Compare rewards
+        new_rewards = mann_model.compute_answer_rewards(
+            new_generated_answers, reference_answers, questions
+        )
+        
+        print(f"\n📊 Training Results Summary:")
+        print(f"  🎯 Pre-training  reward: {rewards.mean().item():.3f} (std: {rewards.std().item():.3f})")
+        print(f"  🎯 Post-training reward: {new_rewards.mean().item():.3f} (std: {new_rewards.std().item():.3f})")
+        improvement = (new_rewards.mean() - rewards.mean()).item()
+        improvement_emoji = "📈" if improvement > 0 else "📉" if improvement < 0 else "➡️"
+        print(f"  {improvement_emoji} Improvement: {improvement:+.3f}")
+        
+        # Show compact memory statistics
+        stats = mann_model.get_memory_statistics()
+        print(f"\n💾 Final Memory Stats:")
+        print(f"  📝 Memories: {stats['total_memories']} | Utilization: {stats['memory_utilization']:.1%}")
+        print(f"  🔍 Retrievals: {stats['total_retrievals']} | Writes: {stats['total_writes']}")
+        print(f"  🧠 Matrix norm: {stats['memory_matrix_norm']:.4f}")
+        
+        print(f"\n✅ PPO Training Demo Complete!")
+        print(f"   📄 Debug details saved to: {debug_log_path}")
+        print(f"   📊 Review the debug log to analyze reward computation process")
+        
+    except Exception as e:
+        print(f"❌ PPO training demo failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+async def demo_ppo_importance_ratio():
+    """Demo PPO importance ratio calculation"""
+    print("\n⚖️ Demo: PPO Importance Ratio Calculation")
+    print("=" * 50)
+    
+    import torch
+    from standalone_mann.mann_core import MemoryAugmentedNetwork
+    
+    print("🧮 Testing PPO importance ratio computation...")
+    
+    # Small model for testing
+    mann_model = MemoryAugmentedNetwork(
+        input_size=32,
+        hidden_size=64, 
+        memory_size=10,
+        memory_dim=32,
+        output_size=100
+    )
+    
+    try:
+        # Create test data
+        hidden_state = torch.randn(64)  # hidden_size
+        memory_context = torch.randn(32)  # memory_dim
+        actions = torch.randint(0, 100, (5,))  # 5 action tokens
+        
+        print(f"  Hidden state shape: {hidden_state.shape}")
+        print(f"  Memory context shape: {memory_context.shape}")
+        print(f"  Actions: {actions.numpy()}")
+        
+        # Test importance ratio calculation
+        importance_ratio = mann_model.memory_interface.compute_ppo_importance_ratio(
+            hidden_state, memory_context, actions
+        )
+        
+        print(f"  Importance ratios: {importance_ratio.detach().numpy()}")
+        print(f"  Average importance ratio: {importance_ratio.mean().item():.3f}")
+        print(f"  Min ratio: {importance_ratio.min().item():.3f}")
+        print(f"  Max ratio: {importance_ratio.max().item():.3f}")
+        
+        # Test advantage computation
+        rewards = torch.tensor([0.8, 0.9, 0.7, 0.6, 0.85])
+        values = torch.tensor([0.5, 0.6, 0.4, 0.3, 0.55])
+        
+        advantages, returns = mann_model.memory_interface.compute_advantages(rewards, values)
+        
+        print(f"\n📈 Advantage Computation:")
+        print(f"  Rewards: {rewards.numpy()}")
+        print(f"  Values: {values.numpy()}")
+        print(f"  Advantages: {advantages.numpy()}")
+        print(f"  Returns: {returns.numpy()}")
+        
+        # Test PPO loss computation
+        loss_dict = mann_model.memory_interface.compute_ppo_loss(
+            hidden_state, memory_context, actions, advantages, returns
+        )
+        
+        print(f"\n📉 PPO Loss Components:")
+        print(f"  Policy loss: {loss_dict['policy_loss'].item():.4f}")
+        print(f"  Value loss: {loss_dict['value_loss'].item():.4f}")
+        print(f"  Entropy loss: {loss_dict['entropy_loss'].item():.4f}")
+        print(f"  Total loss: {loss_dict['total_loss'].item():.4f}")
+        print(f"  Entropy: {loss_dict['entropy'].item():.4f}")
+        
+        print(f"\n✅ PPO Importance Ratio Demo Complete!")
+        
+    except Exception as e:
+        print(f"❌ PPO importance ratio demo failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 async def demo_api_integration():
     """Demo API integration"""
     print("\n🌐 Demo: API Integration")
@@ -332,6 +618,8 @@ async def main():
     demos = [
         ("Basic Conversation", demo_basic_conversation),
         ("External Working Memory", demo_external_working_memory),
+        ("PPO Training", demo_ppo_training),
+        ("PPO Importance Ratio", demo_ppo_importance_ratio),
         ("Memory Search", demo_memory_search),
         ("Memory Management", demo_memory_management),
         ("Health Monitoring", demo_health_monitoring),
@@ -352,18 +640,23 @@ async def main():
     print("\n🎉 All demos completed!")
     print("\n💡 To run individual demos:")
     print("  python demo.py --demo basic")
-    print("  python demo.py --demo external")
+    print("  python demo.py --demo external") 
+    print("  python demo.py --demo ppo")
+    print("  python demo.py --demo ppo-ratio")
     print("  python demo.py --demo search")
     print("  python demo.py --demo memory")
     print("  python demo.py --demo health")
     print("  python demo.py --demo api")
+    print("\n🧪 Or run organized test suite:")
+    print("  cd tests && python run_all_tests.py")
+    print("  cd tests && python test_ppo_training.py  # PPO with CSV data")
 
 
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="MANN CLI Chatbot Demo")
-    parser.add_argument("--demo", choices=["basic", "external", "search", "memory", "health", "api"], 
+    parser.add_argument("--demo", choices=["basic", "external", "ppo", "ppo-ratio", "search", "memory", "health", "api"], 
                        help="Run specific demo")
     
     args = parser.parse_args()
@@ -372,6 +665,8 @@ if __name__ == "__main__":
         demo_map = {
             "basic": demo_basic_conversation,
             "external": demo_external_working_memory,
+            "ppo": demo_ppo_training,
+            "ppo-ratio": demo_ppo_importance_ratio,
             "search": demo_memory_search,
             "memory": demo_memory_management,
             "health": demo_health_monitoring,

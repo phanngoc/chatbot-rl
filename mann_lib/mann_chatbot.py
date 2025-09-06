@@ -278,10 +278,10 @@ class MANNChatbot:
         
         return min(base_importance, 3.0)  # Cap at 3.0
     
-    async def search_memories(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    async def search_memories(self, query: str, top_k: int = 5, min_similarity: float = 0.0) -> List[Dict[str, Any]]:
         """Search memories"""
         try:
-            results = self.mann_model.search_memories(query, top_k=top_k)
+            results = self.mann_model.search_memories(query, top_k=top_k, min_similarity=min_similarity)
             return results
         except Exception as e:
             self.logger.error(f"Failed to search memories: {e}")
